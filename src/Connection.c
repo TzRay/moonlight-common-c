@@ -336,8 +336,8 @@ int LiStartConnection(PSERVER_INFORMATION serverInfo, PSTREAM_CONFIGURATION stre
             if (!IS_SUNSHINE()) {
                 Limelog("PCM passthrough is only supported by Sunshine; falling back to Opus\n");
             }
-            else if (CHANNEL_COUNT_FROM_AUDIO_CONFIGURATION(StreamConfig.audioConfiguration) > 6) {
-                Limelog("PCM passthrough capped at 5.1 (6 channels); falling back to Opus for %d-channel config\n",
+            else if (CHANNEL_COUNT_FROM_AUDIO_CONFIGURATION(StreamConfig.audioConfiguration) > 12) {
+                Limelog("PCM passthrough supports max 7.1.4 (12 channels); falling back to Opus for %d-channel config\n",
                         CHANNEL_COUNT_FROM_AUDIO_CONFIGURATION(StreamConfig.audioConfiguration));
             }
             else {

@@ -563,7 +563,7 @@ static PSDP_OPTION getAttributesList(char*urlSafeAddr) {
             AudioPacketDuration = 32;
         }
         // PCM passthrough: keep frames as small as possible. 5 ms @ 48 kHz =
-        // 240 samples, 5.1ch = 2880 B which fits the 4 KB receive buffer.
+        // 240 samples, 7.1.4 = 5760 B which fits the 8 KB receive buffer.
         else if (NegotiatedAudioCodec == AUDIO_CODEC_PCM_S16) {
             AudioPacketDuration = 5;
         }
