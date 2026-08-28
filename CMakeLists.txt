@@ -10,6 +10,8 @@ option(CODE_ANALYSIS "Run code analysis during compilation" OFF)
 
 SET(CMAKE_C_STANDARD 11)
 
+include(CTest)
+
 set(CMAKE_POSITION_INDEPENDENT_CODE_BACKUP ${CMAKE_POSITION_INDEPENDENT_CODE})
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 add_subdirectory(enet)
@@ -117,3 +119,41 @@ target_include_directories(moonlight-common-c SYSTEM PRIVATE
 )
 
 target_compile_definitions(moonlight-common-c PRIVATE HAS_SOCKLEN_T)
+
+if (BUILD_TESTING)
+  add_executable(cursor-protocol-golden-tests
+    tests/CursorStreamGoldenTest.c
+    src/CursorStream.c
+  )
+  target_include_directories(cursor-protocol-golden-tests PRIVATE src)
+  if(MSVC)
+    target_compile_options(cursor-protocol-golden-tests PRIVATE /W3 /WX)
+  else()
+    target_compile_options(cursor-protocol-golden-tests PRIVATE -Wall -Wextra -Werror)
+  endif()
+  add_test(NAME cursor-protocol-golden-tests COMMAND cursor-protocol-golden-tests)
+
+  add_executable(ds5-haptics-protocol-golden-tests
+    tests/Ds5HapticsStreamGoldenTest.c
+    src/Ds5HapticsStream.c
+  )
+  target_include_directories(ds5-haptics-protocol-golden-tests PRIVATE src)
+  if(MSVC)
+    target_compile_options(ds5-haptics-protocol-golden-tests PRIVATE /W3 /WX)
+  else()
+    target_compile_options(ds5-haptics-protocol-golden-tests PRIVATE -Wall -Wextra -Werror)
+  endif()
+  add_test(NAME ds5-haptics-protocol-golden-tests COMMAND ds5-haptics-protocol-golden-tests)
+
+  add_executable(ds5-haptics-ir-protocol-golden-tests
+    tests/Ds5HapticsIrStreamGoldenTest.c
+    src/Ds5HapticsIrStream.c
+  )
+  target_include_directories(ds5-haptics-ir-protocol-golden-tests PRIVATE src)
+  if(MSVC)
+    target_compile_options(ds5-haptics-ir-protocol-golden-tests PRIVATE /W3 /WX)
+  else()
+    target_compile_options(ds5-haptics-ir-protocol-golden-tests PRIVATE -Wall -Wextra -Werror)
+  endif()
+  add_test(NAME ds5-haptics-ir-protocol-golden-tests COMMAND ds5-haptics-ir-protocol-golden-tests)
+endif()

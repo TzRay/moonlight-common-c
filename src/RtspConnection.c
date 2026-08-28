@@ -635,6 +635,46 @@ static bool playStream(PRTSP_MESSAGE response, char* target, int* error) {
     return ret;
 }
 
+// Parse the Sunshine dynamic HDR negotiation headers from the ANNOUNCE
+// response into the session-wide negotiated globals.
+static void parseDynamicHdrNegotiation(PRTSP_MESSAGE response) {
+    const char* formatOption = getOptionContent(response->options, "X-SS-Dynamic-HDR");
+    if (formatOption == NULL) {
+        NegotiatedDynamicHdrFormat = DYNAMIC_HDR_FORMAT_NONE;
+        NegotiatedDynamicHdrFallback = DYNAMIC_HDR_FALLBACK_NONE;
+        return;
+    }
+
+    NegotiatedDynamicHdrFormat = atoi(formatOption);
+
+    // The fallback arrives as the host enum name, not a number.
+    const char* fallbackOption = getOptionContent(response->options, "X-SS-Dynamic-HDR-Fallback");
+    if (fallbackOption == NULL) {
+        NegotiatedDynamicHdrFallback = DYNAMIC_HDR_FALLBACK_NONE;
+    }
+    else if (strcmp(fallbackOption, "codec_unsupported") == 0) {
+        NegotiatedDynamicHdrFallback = DYNAMIC_HDR_FALLBACK_CODEC_UNSUPPORTED;
+    }
+    else if (strcmp(fallbackOption, "colorspace_unsupported") == 0) {
+        NegotiatedDynamicHdrFallback = DYNAMIC_HDR_FALLBACK_COLORSPACE_UNSUPPORTED;
+    }
+    else if (strcmp(fallbackOption, "client_caps_missing") == 0) {
+        NegotiatedDynamicHdrFallback = DYNAMIC_HDR_FALLBACK_CLIENT_CAPS_MISSING;
+    }
+    else if (strcmp(fallbackOption, "direct_surface_missing") == 0) {
+        NegotiatedDynamicHdrFallback = DYNAMIC_HDR_FALLBACK_DIRECT_SURFACE_MISSING;
+    }
+    else if (strcmp(fallbackOption, "preference") == 0) {
+        NegotiatedDynamicHdrFallback = DYNAMIC_HDR_FALLBACK_PREFERENCE;
+    }
+    else {
+        NegotiatedDynamicHdrFallback = DYNAMIC_HDR_FALLBACK_NONE;
+    }
+
+    Limelog("Dynamic HDR negotiated: %d (dolby vision fallback: %d)\n",
+        NegotiatedDynamicHdrFormat, NegotiatedDynamicHdrFallback);
+}
+
 // Send RTSP ANNOUNCE message
 static bool sendVideoAnnounce(PRTSP_MESSAGE response, int* error) {
     RTSP_MESSAGE request;
@@ -1012,7 +1052,7 @@ static bool parseUrlAddrFromRtspUrlString(const char* rtspUrlString, char* desti
 
 // SDP attributes are in the form:
 // a=x-nv-bwe.bwuSafeZoneLowLimit:70\r\n
-bool parseSdpAttributeToUInt(const char* payload, const char* name, unsigned int* val) {
+bool parseSdpAttributeToUInt(const char* payload, const char* name, uint32_t* val) {
     // Find the entry for the specified attribute name
     char* attribute = strstr(payload, name);
     if (!attribute) {
@@ -1536,6 +1576,11 @@ int performRtspHandshake(PSERVER_INFORMATION serverInfo) {
             freeMessage(&response);
             goto Exit;
         }
+
+        // Sunshine dynamic HDR negotiation result. Hosts without the
+        // extension send no X-SS-Dynamic-HDR header; that is the legacy
+        // outcome (DYNAMIC_HDR_FORMAT_NONE) rather than an error.
+        parseDynamicHdrNegotiation(&response);
 
         freeMessage(&response);
     }

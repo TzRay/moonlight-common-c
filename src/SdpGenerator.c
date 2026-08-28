@@ -1,4 +1,5 @@
 #include "Limelight-internal.h"
+#include <inttypes.h>
 
 #define MAX_OPTION_NAME_LEN 128
 
@@ -273,7 +274,13 @@ static PSDP_OPTION getAttributesList(char*urlSafeAddr) {
     if (IS_SUNSHINE()) {
         // Send client feature flags to Sunshine hosts
         uint32_t moonlightFeatureFlags = ML_FF_FEC_STATUS | ML_FF_SESSION_ID_V1;
-        snprintf(payloadStr, sizeof(payloadStr), "%u", moonlightFeatureFlags);
+        if (ListenerCallbacks.ds5HapticsPcm != NULL) {
+            moonlightFeatureFlags |= ML_FF_DS5_HAPTICS_PCM;
+        }
+        if (ListenerCallbacks.ds5HapticsIrV2 != NULL) {
+            moonlightFeatureFlags |= ML_FF_DS5_HAPTICS_IR_V2;
+        }
+        snprintf(payloadStr, sizeof(payloadStr), "%" PRIu32, moonlightFeatureFlags);
         err |= addAttributeString(&optionHead, "x-ml-general.featureFlags", payloadStr);
 
         // New-style control stream encryption is low overhead, so we enable it any time it is supported
@@ -312,7 +319,7 @@ static PSDP_OPTION getAttributesList(char*urlSafeAddr) {
             }
         }
 
-        snprintf(payloadStr, sizeof(payloadStr), "%u", EncryptionFeaturesEnabled);
+        snprintf(payloadStr, sizeof(payloadStr), "%" PRIu32, EncryptionFeaturesEnabled);
         err |= addAttributeString(&optionHead, "x-ss-general.encryptionEnabled", payloadStr);
 
         // Enable YUV444 if requested
@@ -321,6 +328,18 @@ static PSDP_OPTION getAttributesList(char*urlSafeAddr) {
         }
         else {
             err |= addAttributeString(&optionHead, "x-ss-video[0].chromaSamplingType", "0");
+        }
+
+        // Sunshine dynamic HDR negotiation (client opt-in). A legacy client
+        // leaves all fields zero and sends nothing, keeping the host on its
+        // historical behavior of unconditional HDR10+ metadata.
+        if (StreamConfig.dynamicHdrCaps != 0 || StreamConfig.dynamicHdrPreference != 0) {
+            snprintf(payloadStr, sizeof(payloadStr), "%d", StreamConfig.dynamicHdrCaps);
+            err |= addAttributeString(&optionHead, "x-ss-video[0].dynamicHdrCaps", payloadStr);
+            snprintf(payloadStr, sizeof(payloadStr), "%d", StreamConfig.dolbyVisionDirectSurface ? 1 : 0);
+            err |= addAttributeString(&optionHead, "x-ss-video[0].dolbyVisionDirectSurface", payloadStr);
+            snprintf(payloadStr, sizeof(payloadStr), "%d", StreamConfig.dynamicHdrPreference);
+            err |= addAttributeString(&optionHead, "x-ss-video[0].dynamicHdrPreference", payloadStr);
         }
     }
 

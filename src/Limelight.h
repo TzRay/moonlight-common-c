@@ -96,6 +96,20 @@ typedef struct _STREAM_CONFIGURATION {
     // the transfer characteristics of the encoded video stream.
     int hdrMode;
 
+    // Sunshine dynamic HDR negotiation (client opt-in). Leaving everything at
+    // zero makes this a legacy client: no negotiation attributes are sent and
+    // hosts keep their historical behavior.
+    //
+    // dynamicHdrCaps bits: 1 << 0 = HDR10+, 1 << 1 = HDR Vivid PQ,
+    // 1 << 2 = HDR Vivid HLG, 1 << 3 = Dolby Vision Profile 8.1.
+    // dynamicHdrPreference: 0 = automatic, 1 = Dolby Vision, 2 = HDR10+,
+    // 3 = HDR10 only. dolbyVisionDirectSurface qualifies the Dolby Vision
+    // cap bit (see the Sunshine dynamic HDR docs). Unknown capability bits
+    // are masked off by the host, so newer clients can safely set them.
+    int dynamicHdrCaps;
+    int dolbyVisionDirectSurface;
+    int dynamicHdrPreference;
+
     // Specifies the data streams where encryption may be enabled if supported
     // by the host PC. Ideally, you would pass ENCFLG_ALL to encrypt everything
     // that we support encrypting. However, lower performance hardware may not
@@ -341,6 +355,11 @@ typedef struct _DECODE_UNIT {
 // supports reference frame invalidation for AV1 streams. This flag is only valid on video renderers.
 #define CAPABILITY_REFERENCE_FRAME_INVALIDATION_AV1 0x40
 
+// If set in the video renderer capabilities field, this flag specifies that the renderer
+// consumes HEVC prefix SEI NALUs and requires them to remain in submitted decode units.
+// Without this capability, prepended SEI NALUs are stripped for compatibility with legacy renderers.
+#define CAPABILITY_PRESERVE_HEVC_SEI 0x80
+
 // If set in the video renderer capabilities field, this macro specifies that the renderer
 // supports slicing to increase decoding performance. The parameter specifies the desired
 // number of slices per frame. This capability is only valid on video renderers.
@@ -562,6 +581,70 @@ typedef void(*ConnListenerResolutionChanged)(uint32_t width, uint32_t height);
 // The buffer is only valid for the duration of the call.
 typedef void(*ConnListenerClipboardData)(const char* data, int length);
 
+// Cursor updates are Sunshine protocol extensions. Pixel data is tightly-packed
+// BGRA8888 and is only present when LI_CURSOR_UPDATE_FLAG_SHAPE is set. The
+// buffer is valid only for the duration of the callback.
+#define LI_CURSOR_UPDATE_FLAG_SHAPE   0x01
+#define LI_CURSOR_UPDATE_FLAG_VISIBLE 0x02
+typedef struct _LI_CURSOR_UPDATE {
+    uint8_t flags;
+    uint32_t shapeId;
+    uint16_t width;
+    uint16_t height;
+    int16_t hotspotX;
+    int16_t hotspotY;
+    const uint8_t* pixels;
+    uint32_t pixelDataLength;
+} LI_CURSOR_UPDATE, *PLI_CURSOR_UPDATE;
+typedef void(*ConnListenerCursorUpdate)(const LI_CURSOR_UPDATE* update);
+
+// Authored DualSense haptics captured from the host's virtual USB audio
+// endpoint. PCM is signed 16-bit little-endian, interleaved haptic-left then
+// haptic-right. The buffer is valid only for the duration of the callback.
+// Packets are intentionally unreliable; use sequenceNumber and the
+// DISCONTINUITY flag to reset a client-side jitter buffer after loss.
+#define LI_DS5_HAPTICS_PCM_FLAG_STREAM_START  0x01
+#define LI_DS5_HAPTICS_PCM_FLAG_STREAM_END    0x02
+#define LI_DS5_HAPTICS_PCM_FLAG_DISCONTINUITY 0x04
+typedef struct _LI_DS5_HAPTICS_PCM_FRAME {
+    uint8_t flags;
+    uint16_t controllerNumber;
+    uint32_t sequenceNumber;
+    uint64_t presentationTimeUs;
+    uint32_t sampleRate;
+    uint16_t frameCount;
+    uint8_t channelCount;
+    uint8_t bitsPerSample;
+    const uint8_t* pcmData;
+    uint32_t pcmDataLength;
+} LI_DS5_HAPTICS_PCM_FRAME, *PLI_DS5_HAPTICS_PCM_FRAME;
+typedef void(*ConnListenerDs5HapticsPcm)(const LI_DS5_HAPTICS_PCM_FRAME* frame);
+
+// Device-independent authored haptics used when the client selected simulated
+// DualSense mode. Values are normalized analysis features, not actuator
+// commands. The client owns device calibration and final rendering.
+#define LI_DS5_HAPTICS_IR_FLAG_DISCONTINUITY 0x01
+#define LI_DS5_HAPTICS_IR_FLAG_PARTIAL       0x02
+#define LI_DS5_HAPTICS_IR_FLAG_STREAM_END    0x04
+#define LI_DS5_HAPTICS_IR_FLAG_SILENT        0x08
+typedef struct _LI_DS5_HAPTICS_IR_LANE_V2 {
+    float rmsAmplitude;
+    float peakAmplitude;
+    float transientStrength;
+    float lowBandRatio;
+    float zeroCrossingRateHz;
+} LI_DS5_HAPTICS_IR_LANE_V2, *PLI_DS5_HAPTICS_IR_LANE_V2;
+typedef struct _LI_DS5_HAPTICS_IR_FRAME_V2 {
+    uint8_t flags;
+    uint16_t controllerNumber;
+    uint32_t sourceSequenceNumber;
+    uint64_t timestampUs;
+    uint32_t sourceFrameCount;
+    LI_DS5_HAPTICS_IR_LANE_V2 lanes[2];
+    float laneCorrelation;
+} LI_DS5_HAPTICS_IR_FRAME_V2, *PLI_DS5_HAPTICS_IR_FRAME_V2;
+typedef void(*ConnListenerDs5HapticsIrV2)(const LI_DS5_HAPTICS_IR_FRAME_V2* frame);
+
 typedef struct _CONNECTION_LISTENER_CALLBACKS {
     ConnListenerStageStarting stageStarting;
     ConnListenerStageComplete stageComplete;
@@ -578,6 +661,9 @@ typedef struct _CONNECTION_LISTENER_CALLBACKS {
     ConnListenerSetAdaptiveTriggers setAdaptiveTriggers;
     ConnListenerResolutionChanged resolutionChanged;
     ConnListenerClipboardData clipboardData;
+    ConnListenerCursorUpdate cursorUpdate;
+    ConnListenerDs5HapticsPcm ds5HapticsPcm;
+    ConnListenerDs5HapticsIrV2 ds5HapticsIrV2;
 } CONNECTION_LISTENER_CALLBACKS, *PCONNECTION_LISTENER_CALLBACKS;
 
 // Use this function to zero the connection callbacks when allocated on the stack or heap
@@ -875,6 +961,7 @@ int LiSendMultiControllerEvent(short controllerNumber, short activeGamepadMask,
 #define LI_CTYPE_XBOX     0x01
 #define LI_CTYPE_PS       0x02
 #define LI_CTYPE_NINTENDO 0x03
+#define LI_CTYPE_STEAM    0x04 // Valve Steam Controller (Xbox-style layout plus dual touchpads, gyro/accel and grip buttons)
 #define LI_CCAP_ANALOG_TRIGGERS 0x01 // Reports values between 0x00 and 0xFF for trigger axes
 #define LI_CCAP_RUMBLE          0x02 // Can rumble in response to ConnListenerRumble() callback
 #define LI_CCAP_TRIGGER_RUMBLE  0x04 // Can rumble triggers in response to ConnListenerRumbleTriggers() callback
@@ -884,6 +971,7 @@ int LiSendMultiControllerEvent(short controllerNumber, short activeGamepadMask,
 #define LI_CCAP_BATTERY_STATE   0x40 // Reports battery state via LiSendControllerBatteryEvent()
 #define LI_CCAP_RGB_LED         0x80 // Can set RGB LED state via ConnListenerSetControllerLED()
 #define LI_CCAP_DUAL_TOUCHPAD  0x100 // Reports touchpad events from 2 separate touchpads
+#define LI_CCAP_DS5_HAPTICS_PCM 0x200 // Can render authored DualSense stereo PCM feedback
 int LiSendControllerArrivalEvent(uint8_t controllerNumber, uint16_t activeGamepadMask, uint8_t type,
                                  uint32_t supportedButtonFlags, uint16_t capabilities);
 
@@ -1136,7 +1224,34 @@ void LiRequestIdrFrame(void);
 #define LI_FF_CONTROLLER_TOUCH_EVENTS 0x02 // LiSendControllerTouchEvent() supported
 #define LI_FF_TOUCHPAD_EVENTS         0x10 // LiSendTouchpadEvent() supported
 #define LI_FF_TOUCHPAD_FRAME_EVENTS   0x20 // LiSendTouchpadFrameEvent() supported
+#define LI_FF_CURSOR_SHAPE            0x40 // Host can send local cursor shape updates
+#define LI_FF_DS5_HAPTICS_PCM         0x80 // Host can stream authored DualSense stereo PCM
+#define LI_FF_DYNAMIC_SDR_WHITE      0x100 // Host accepts runtime client SDR reference white updates
 uint32_t LiGetHostFeatureFlags(void);
+
+// Update the client's SDR reference white (50-1000 nits inclusive) during an
+// encrypted Sunshine HLG session. This changes only the supported host
+// conversion path; it does not reconfigure the host display, VDD HDR
+// capabilities, or encoder.
+#define LI_DYNAMIC_SDR_WHITE_OK                 0
+#define LI_DYNAMIC_SDR_WHITE_ERR_INVALID       -1
+#define LI_DYNAMIC_SDR_WHITE_ERR_UNSUPPORTED   -2
+#define LI_DYNAMIC_SDR_WHITE_ERR_NOT_CONNECTED -3
+#define LI_DYNAMIC_SDR_WHITE_ERR_SEND_FAILED   -4
+int LiSendClientSdrWhiteNits(float nits);
+
+// Select whether Sunshine composites the cursor into the video frame or sends
+// cursor shape updates for local rendering. This is only supported when the
+// host advertises LI_FF_CURSOR_SHAPE.
+#define LI_CURSOR_MODE_VIDEO 0
+#define LI_CURSOR_MODE_LOCAL 1
+
+#define LI_CURSOR_MODE_OK                0
+#define LI_CURSOR_MODE_ERR_INVALID      -1
+#define LI_CURSOR_MODE_ERR_UNSUPPORTED  -2
+#define LI_CURSOR_MODE_ERR_NOT_CONNECTED -3
+#define LI_CURSOR_MODE_ERR_SEND_FAILED  -4
+int LiSetCursorMode(int cursorMode);
 
 // Returns the audio codec actually negotiated for this session. See AUDIO_CODEC_*
 // constants. Valid only after AudioRendererInit has been called. Before that,
@@ -1152,6 +1267,40 @@ int LiGetNegotiatedAudioCodec(void);
 // Returns the audio bitrate (bps) negotiated for AC3/E-AC3 sessions, or 0 when
 // audioCodec == AUDIO_CODEC_OPUS. Valid only after AudioRendererInit.
 int LiGetNegotiatedAudioBitrate(void);
+
+// Dynamic HDR format values for STREAM_CONFIGURATION.dynamicHdrCaps bits,
+// LiGetNegotiatedDynamicHdrFormat() results, and the X-SS-Dynamic-HDR wire
+// value. These match the Sunshine host's dynamic HDR selection.
+#define DYNAMIC_HDR_CAPS_HDR10_PLUS (1 << 0)
+#define DYNAMIC_HDR_CAPS_VIVID_PQ (1 << 1)
+#define DYNAMIC_HDR_CAPS_VIVID_HLG (1 << 2)
+#define DYNAMIC_HDR_CAPS_DOLBY_VISION_81 (1 << 3)
+
+#define DYNAMIC_HDR_FORMAT_NONE 0
+#define DYNAMIC_HDR_FORMAT_HDR10_PLUS 1
+#define DYNAMIC_HDR_FORMAT_VIVID_PQ 2
+#define DYNAMIC_HDR_FORMAT_VIVID_HLG 3
+#define DYNAMIC_HDR_FORMAT_DOLBY_VISION_PROFILE_81 4
+
+// Returns the dynamic HDR format the Sunshine host selected for this session,
+// parsed from the X-SS-Dynamic-HDR RTSP ANNOUNCE response header. Hosts
+// without the extension (or sessions that sent no capabilities) yield
+// DYNAMIC_HDR_FORMAT_NONE. Valid only after the RTSP handshake completes.
+int LiGetNegotiatedDynamicHdrFormat(void);
+
+// Returns the reason Dolby Vision was not selected despite the client asking
+// for it, parsed from X-SS-Dynamic-HDR-Fallback. The wire carries the enum
+// name string; these numbers are stable identities, so a removed member
+// leaves a gap instead of shifting the rest (1 was host_disabled, retired
+// when the host opened the negotiation unconditionally). Unknown names map
+// to DYNAMIC_HDR_FALLBACK_NONE.
+#define DYNAMIC_HDR_FALLBACK_NONE 0
+#define DYNAMIC_HDR_FALLBACK_CODEC_UNSUPPORTED 2
+#define DYNAMIC_HDR_FALLBACK_COLORSPACE_UNSUPPORTED 3
+#define DYNAMIC_HDR_FALLBACK_CLIENT_CAPS_MISSING 4
+#define DYNAMIC_HDR_FALLBACK_DIRECT_SURFACE_MISSING 5
+#define DYNAMIC_HDR_FALLBACK_PREFERENCE 6
+int LiGetNegotiatedDynamicHdrFallback(void);
 
 #ifdef __cplusplus
 }
