@@ -41,7 +41,7 @@ endif()
 target_link_libraries(moonlight-common-c PRIVATE enet)
 
 if(MSVC)
-  target_compile_options(moonlight-common-c PRIVATE /W3 /wd4100 /wd4232 /wd5105 /WX)
+  target_compile_options(moonlight-common-c PRIVATE /W3 /wd4100 /wd4232 /wd5105 /WX /std:c11 /experimental:c11atomics)
   target_link_libraries(moonlight-common-c PRIVATE ws2_32.lib winmm.lib)
 elseif(MINGW)
   target_link_libraries(moonlight-common-c PRIVATE -lws2_32 -lwinmm)
@@ -121,6 +121,42 @@ target_include_directories(moonlight-common-c SYSTEM PRIVATE
 target_compile_definitions(moonlight-common-c PRIVATE HAS_SOCKLEN_T)
 
 if (BUILD_TESTING)
+  get_target_property(_common_c_type moonlight-common-c TYPE)
+  if(_common_c_type STREQUAL "STATIC_LIBRARY")
+    # This test includes the sender and links its internal platform/queue helpers.
+    add_executable(controller-handoff-queue-tests tests/ControllerHandoffQueueTest.c)
+    target_include_directories(controller-handoff-queue-tests PRIVATE src enet/include)
+    target_link_libraries(controller-handoff-queue-tests PRIVATE moonlight-common-c)
+    target_compile_definitions(controller-handoff-queue-tests PRIVATE LC_DEBUG HAS_SOCKLEN_T)
+    # Assertions also execute the sends in release builds.
+    if(MSVC)
+      target_compile_options(controller-handoff-queue-tests PRIVATE /UNDEBUG)
+    else()
+      target_compile_options(controller-handoff-queue-tests PRIVATE -UNDEBUG)
+    endif()
+    add_test(NAME controller-handoff-queue-tests COMMAND controller-handoff-queue-tests)
+    add_executable(pyrowave-decode-unit-tests tests/PyrowaveDecodeUnitTest.c)
+    target_include_directories(pyrowave-decode-unit-tests PRIVATE
+      enet/include $<TARGET_PROPERTY:moonlight-common-c,INCLUDE_DIRECTORIES>)
+    target_compile_definitions(pyrowave-decode-unit-tests PRIVATE
+      $<TARGET_PROPERTY:moonlight-common-c,COMPILE_DEFINITIONS>)
+    target_compile_options(pyrowave-decode-unit-tests PRIVATE
+      $<TARGET_PROPERTY:moonlight-common-c,COMPILE_OPTIONS>)
+    target_link_libraries(pyrowave-decode-unit-tests PRIVATE moonlight-common-c)
+    add_test(NAME pyrowave-decode-unit-tests COMMAND pyrowave-decode-unit-tests)
+  endif()
+
+  add_executable(control-stream-packet-tests
+    tests/ControlStreamPacketTest.c
+  )
+  target_include_directories(control-stream-packet-tests PRIVATE src)
+  if(MSVC)
+    target_compile_options(control-stream-packet-tests PRIVATE /W3 /WX)
+  else()
+    target_compile_options(control-stream-packet-tests PRIVATE -Wall -Wextra -Werror)
+  endif()
+  add_test(NAME control-stream-packet-tests COMMAND control-stream-packet-tests)
+
   add_executable(cursor-protocol-golden-tests
     tests/CursorStreamGoldenTest.c
     src/CursorStream.c
@@ -168,4 +204,29 @@ if (BUILD_TESTING)
     target_compile_options(ds5-haptics-ir-protocol-golden-tests PRIVATE -Wall -Wextra -Werror)
   endif()
   add_test(NAME ds5-haptics-ir-protocol-golden-tests COMMAND ds5-haptics-ir-protocol-golden-tests)
+
+  add_executable(pyrowave-protocol-golden-tests
+    tests/PyrowaveProtocolGoldenTest.c
+    src/PyrowaveProtocol.c
+  )
+  target_include_directories(pyrowave-protocol-golden-tests PRIVATE src)
+  if(MSVC)
+    target_compile_options(pyrowave-protocol-golden-tests PRIVATE /W3 /WX)
+  else()
+    target_compile_options(pyrowave-protocol-golden-tests PRIVATE -Wall -Wextra -Werror)
+  endif()
+  add_test(NAME pyrowave-protocol-golden-tests COMMAND pyrowave-protocol-golden-tests)
+
+  add_executable(pyrowave-reassembly-golden-tests
+    tests/PyrowaveReassemblyGoldenTest.c
+    src/PyrowaveProtocol.c
+    src/PyrowaveReassembly.c
+  )
+  target_include_directories(pyrowave-reassembly-golden-tests PRIVATE src)
+  if(MSVC)
+    target_compile_options(pyrowave-reassembly-golden-tests PRIVATE /W3 /WX)
+  else()
+    target_compile_options(pyrowave-reassembly-golden-tests PRIVATE -Wall -Wextra -Werror)
+  endif()
+  add_test(NAME pyrowave-reassembly-golden-tests COMMAND pyrowave-reassembly-golden-tests)
 endif()
