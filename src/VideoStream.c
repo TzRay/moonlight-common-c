@@ -1,4 +1,5 @@
 #include "Limelight-internal.h"
+#include "VideoDiagnostics.h"
 
 #include <stdatomic.h>
 
@@ -46,6 +47,7 @@ static _Atomic uint64_t rtpVideoBytesReceived;
 
 // Initialize the video stream
 void initializeVideoStream(void) {
+    initializeVideoDiagnostics();
     initializeVideoDepacketizer(StreamConfig.packetSize);
     RtpvInitializeQueue(&rtpQueue);
     decryptionCtx = PltCreateCryptoContext();
@@ -57,6 +59,7 @@ void initializeVideoStream(void) {
 
 // Clean up the video stream
 void destroyVideoStream(void) {
+    flushVideoDiagnostics();
     PltDestroyCryptoContext(decryptionCtx);
     destroyVideoDepacketizer();
     RtpvCleanupQueue(&rtpQueue);
@@ -102,6 +105,10 @@ static void VideoReceiveThreadProc(void* context) {
     bool useSelect;
     int waitingForVideoMs;
     bool encrypted;
+    const bool timingEnabled = (StreamConfig.videoReceiveOptions & VIDEO_RECEIVE_TIMING_STATS) != 0;
+    uint64_t lastLoopStartUs = 0;
+
+    configureVideoReceiveThread();
 
     encrypted = !!(EncryptionFeaturesEnabled & SS_ENC_VIDEO);
     decryptedSize = StreamConfig.packetSize + MAX_RTP_HEADER_SIZE;
@@ -135,6 +142,14 @@ static void VideoReceiveThreadProc(void* context) {
     waitingForVideoMs = 0;
     while (!PltIsThreadInterrupted(&receiveThread)) {
         PRTP_PACKET packet;
+        uint64_t receiveStartUs = 0;
+        uint64_t receivedUs = 0;
+
+        if (timingEnabled) {
+            uint64_t nowUs = PltGetMicroseconds();
+            if (lastLoopStartUs != 0) recordVideoTiming(VIDEO_TIMING_LOOP_GAP, lastLoopStartUs, nowUs);
+            lastLoopStartUs = nowUs;
+        }
 
         if (buffer == NULL) {
             buffer = (char*)malloc(bufferSize);
@@ -145,13 +160,20 @@ static void VideoReceiveThreadProc(void* context) {
             }
         }
 
+        if (timingEnabled) receiveStartUs = PltGetMicroseconds();
         err = recvUdpSocket(rtpSocket,
                             encrypted ? encryptedBuffer : buffer,
                             receiveSize,
                             useSelect);
+        // Clock reads and diagnostic logging may change errno/WSAGetLastError.
+        const int receiveError = err < 0 ? (int)LastSocketError() : 0;
+        if (timingEnabled) {
+            receivedUs = PltGetMicroseconds();
+            recordVideoTiming(VIDEO_TIMING_RECEIVE_WAIT, receiveStartUs, receivedUs);
+        }
         if (err < 0) {
-            Limelog("Video Receive: recvUdpSocket() failed: %d\n", (int)LastSocketError());
-            ListenerCallbacks.connectionTerminated(LastSocketFail());
+            Limelog("Video Receive: recvUdpSocket() failed: %d\n", receiveError);
+            ListenerCallbacks.connectionTerminated(receiveError != 0 ? receiveError : -1);
             break;
         }
         else if  (err == 0) {
@@ -247,6 +269,11 @@ static void VideoReceiveThreadProc(void* context) {
         packet->ssrc = BE32(packet->ssrc);
 
         queueStatus = RtpvAddPacket(&rtpQueue, packet, err, (PRTPV_QUEUE_ENTRY)&buffer[decryptedSize]);
+        if (timingEnabled) {
+            // Includes decrypt, RTP/FEC/reassembly and any direct decoder submit.
+            // This is wall time, not CPU time or proof of scheduler starvation.
+            recordVideoTiming(VIDEO_TIMING_PACKET_PROCESS, receivedUs, PltGetMicroseconds());
+        }
 
         if (queueStatus == RTPF_RET_QUEUED) {
             // The queue owns the buffer
@@ -278,7 +305,7 @@ static void VideoDecoderThreadProc(void* context) {
             return;
         }
 
-        LiCompleteVideoFrame(frameHandle, VideoCallbacks.submitDecodeUnit(decodeUnit));
+        LiCompleteVideoFrame(frameHandle, submitVideoDecodeUnit(decodeUnit));
     }
 }
 

@@ -1,4 +1,5 @@
 #include "Limelight-internal.h"
+#include "VideoDiagnostics.h"
 
 #include <rs.h>
 
@@ -334,7 +335,10 @@ static int reconstructFrame(PRTP_VIDEO_QUEUE queue) {
         }
     }
 
+    const bool timingEnabled = (StreamConfig.videoReceiveOptions & VIDEO_RECEIVE_TIMING_STATS) != 0;
+    const uint64_t fecStartUs = timingEnabled ? PltGetMicroseconds() : 0;
     ret = reed_solomon_decode(rs, packets, marks, totalPackets, receiveSize);
+    if (timingEnabled) recordVideoTiming(VIDEO_TIMING_FEC_DECODE, fecStartUs, PltGetMicroseconds());
 
     // We should always provide enough parity to recover the missing data successfully.
     // If this fails, something is probably wrong with our FEC state.

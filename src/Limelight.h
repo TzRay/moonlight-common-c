@@ -44,6 +44,10 @@ extern "C" {
 // should not be freed by the caller.
 const char* LiGetLaunchUrlQueryParameters(void);
 
+// Client-local experiments. These flags never change RTSP/SDP or the host stream.
+#define VIDEO_RECEIVE_AVOID_CPU0   0x01
+#define VIDEO_RECEIVE_TIMING_STATS 0x02
+
 typedef struct _STREAM_CONFIGURATION {
     // Dimensions in pixels of the desired video stream
     int width;
@@ -157,6 +161,10 @@ typedef struct _STREAM_CONFIGURATION {
     // RS FEC preference: -2=host default, -1=automatic, 0..100=fixed percentage.
     // Unsupported hosts ignore this preference. PyroWave uses its own protection.
     int videoFecPercentage;
+
+    // Zero preserves the platform scheduler and disables timing instrumentation.
+    // Set per connection, before LiStartConnection; do not mutate during streaming.
+    int videoReceiveOptions;
 } STREAM_CONFIGURATION, *PSTREAM_CONFIGURATION;
 
 // Initialize the stream configuration, including compatible host-default FEC.

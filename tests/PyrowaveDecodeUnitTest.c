@@ -166,6 +166,8 @@ int main(void) {
     NegotiatedDynamicHdrFormat = DYNAMIC_HDR_FORMAT_NONE;
     CHECK(processPyrowaveMetadata(NULL, 0, 0));
     CHECK(frameHostProcessingLatency == 0);
+    // Match the production lifecycle before destroying a queue that has held frames.
+    stopVideoDepacketizer();
     destroyVideoDepacketizer();
     puts("PASS: same-frame metadata ownership and production depacketizer validation");
     return 0;

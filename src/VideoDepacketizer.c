@@ -1,4 +1,5 @@
 #include "Limelight-internal.h"
+#include "VideoDiagnostics.h"
 
 #include <limits.h>
 
@@ -656,7 +657,7 @@ static void reassembleFrame(int frameNumber, bool frameIsLTR) {
             else {
                 // Submit the frame to the decoder
                 validateDecodeUnitForPlayback(&qdu->decodeUnit);
-                LiCompleteVideoFrame(qdu, VideoCallbacks.submitDecodeUnit(&qdu->decodeUnit));
+                LiCompleteVideoFrame(qdu, submitVideoDecodeUnit(&qdu->decodeUnit));
             }
 
             // Notify the control connection
