@@ -2,11 +2,24 @@
 #include "ControlStreamPacket.h"
 #include "CursorStream.h"
 #include "Ds5HapticsStream.h"
+#include "Ds5HapticsStateStream.h"
 #include "Ds5HapticsIrStream.h"
+#include "HostSessionStateStream.h"
 #include "RemoteTextContextStream.h"
 
 #include <math.h>
 #include <stdatomic.h>
+
+ConnListenerDs5HapticsState Ds5HapticsStateCallback;
+ConnListenerHostSessionState HostSessionStateCallback;
+
+void LiSetDs5HapticsStateCallback(ConnListenerDs5HapticsState callback) {
+    Ds5HapticsStateCallback = callback;
+}
+
+void LiSetHostSessionStateCallback(ConnListenerHostSessionState callback) {
+    HostSessionStateCallback = callback;
+}
 
 // This is a private header, but it just contains some time macros
 #include <enet/time.h>
@@ -999,8 +1012,6 @@ static bool sendMessageEnet(short ptype, int paylen, const void* payload, uint8_
     if (encryptedControlStream) {
         PNVCTL_ENCRYPTED_PACKET_HEADER encPacket;
         PNVCTL_ENET_PACKET_HEADER_V2 packet;
-        char tempBufferStack[256];
-        char* tempBuffer = tempBufferStack;
         size_t plaintextLen = sizeof(*packet) + (size_t)paylen;
         unsigned short encryptedLength = getEncryptedControlPacketLength(paylen);
 
@@ -1008,22 +1019,10 @@ static bool sendMessageEnet(short ptype, int paylen, const void* payload, uint8_
             return false;
         }
 
-        // Most control messages are tiny; fall back to a heap allocation for the
-        // few that aren't (e.g. clipboard payloads up to 65511 bytes).
-        if (plaintextLen > sizeof(tempBufferStack)) {
-            tempBuffer = (char*)malloc(plaintextLen);
-            if (tempBuffer == NULL) {
-                return false;
-            }
-        }
-
         enetPacket = enet_packet_create(NULL,
                                         sizeof(*encPacket) + AES_GCM_TAG_LENGTH + plaintextLen,
                                         flags);
         if (enetPacket == NULL) {
-            if (tempBuffer != tempBufferStack) {
-                free(tempBuffer);
-            }
             return false;
         }
 
@@ -1037,19 +1036,13 @@ static bool sendMessageEnet(short ptype, int paylen, const void* payload, uint8_
         encPacket->seq = currentEnetSequenceNumber++;
 
         // Construct the plaintext data for encryption
-        packet = (PNVCTL_ENET_PACKET_HEADER_V2)tempBuffer;
+        packet = (PNVCTL_ENET_PACKET_HEADER_V2)(((unsigned char*)(encPacket + 1)) + AES_GCM_TAG_LENGTH);
         packet->type = ptype;
         packet->payloadLength = (unsigned short)paylen;
         memcpy(&packet[1], payload, (size_t)paylen);
 
         // Encrypt the data into the final packet (and byteswap for BE machines)
-        bool encOk = encryptControlMessage(encPacket, packet);
-
-        if (tempBuffer != tempBufferStack) {
-            free(tempBuffer);
-        }
-
-        if (!encOk) {
+        if (!encryptControlMessage(encPacket, packet)) {
             Limelog("Failed to encrypt control stream message\n");
             enet_packet_destroy(enetPacket);
             PltUnlockMutex(&enetMutex);
@@ -1410,6 +1403,10 @@ static void queueAsyncCallback(PNVCTL_ENET_PACKET_HEADER_V1 ctlHdr, int packetLe
         BbGet16(&bb, &queuedCb->data.setMotionEventState.reportRateHz);
         BbGet8(&bb, &queuedCb->data.setMotionEventState.motionType);
 
+        // Remote demand must not depend on a delayed or full platform callback queue.
+        setControllerMotionEnabled(queuedCb->data.setMotionEventState.controllerNumber,
+                                   queuedCb->data.setMotionEventState.motionType,
+                                   queuedCb->data.setMotionEventState.reportRateHz > 0);
         queuedCb->typeIndex = IDX_SET_MOTION_EVENT;
     }
     else if (ctlHdr->type == packetTypes[IDX_SET_RGB_LED]) {
@@ -1495,6 +1492,11 @@ static void dispatchDs5HapticsPcm(const LI_DS5_HAPTICS_PCM_FRAME* frame, void* c
 static void dispatchDs5HapticsIrV2(const LI_DS5_HAPTICS_IR_FRAME_V2* frame, void* context) {
     (void)context;
     ListenerCallbacks.ds5HapticsIrV2(frame);
+}
+
+static void dispatchDs5HapticsIrExtended(const LI_DS5_HAPTICS_IR_EXTENDED_FRAME* frame, void* context) {
+    (void)context;
+    ListenerCallbacks.ds5HapticsIrExtended(frame);
 }
 
 static void processRemoteTextContext(const uint8_t* payload, int payloadLength) {
@@ -1748,6 +1750,23 @@ static void controlReceiveThreadFunc(void* context) {
                                         packetLength - (int)sizeof(*ctlHdr));
                 }
             }
+            else if (ctlHdr->type == 0x550D) {
+                uint16_t controller;
+                const uint8_t* state;
+                if (Ds5HapticsStateCallback != NULL && parseDs5HapticsState(
+                        (const uint8_t*)(ctlHdr + 1), packetLength - (int)sizeof(*ctlHdr),
+                        &controller, &state)) {
+                    Ds5HapticsStateCallback(controller, state);
+                }
+            }
+            else if (ctlHdr->type == 0x550E) {
+                uint8_t sessionState;
+                if (HostSessionStateCallback != NULL && parseHostSessionState(
+                        (const uint8_t*)(ctlHdr + 1), packetLength - (int)sizeof(*ctlHdr),
+                        &sessionState)) {
+                    HostSessionStateCallback(sessionState);
+                }
+            }
             else if (ctlHdr->type == packetTypes[IDX_DS5_HAPTICS_PCM]) {
                 if (ListenerCallbacks.ds5HapticsPcm != NULL &&
                         packetLength > (int)sizeof(*ctlHdr)) {
@@ -1758,12 +1777,16 @@ static void controlReceiveThreadFunc(void* context) {
                 }
             }
             else if (ctlHdr->type == packetTypes[IDX_DS5_HAPTICS_IR_V2]) {
-                if (ListenerCallbacks.ds5HapticsIrV2 != NULL &&
-                        packetLength > (int)sizeof(*ctlHdr)) {
-                    processDs5HapticsIrStreamPacket((const uint8_t*)(ctlHdr + 1),
-                                                    packetLength - (int)sizeof(*ctlHdr),
-                                                    dispatchDs5HapticsIrV2,
-                                                    NULL);
+                if (ListenerCallbacks.ds5HapticsIrV2 != NULL && packetLength > (int)sizeof(*ctlHdr)) {
+                    const uint8_t* irPayload = (const uint8_t*)(ctlHdr + 1);
+                    const int irLength = packetLength - (int)sizeof(*ctlHdr);
+                    if (irLength == DS5_HAPTICS_IR_STREAM_WIRE_SIZE) {
+                        processDs5HapticsIrStreamPacket(irPayload, irLength, dispatchDs5HapticsIrV2, NULL);
+                    }
+                    else if (ListenerCallbacks.ds5HapticsIrExtended != NULL) {
+                        processDs5HapticsIrExtendedStreamPacket(irPayload, irLength,
+                                                               dispatchDs5HapticsIrExtended, NULL);
+                    }
                 }
             }
             else if (ctlHdr->type == packetTypes[IDX_REMOTE_TEXT_CONTEXT]) {
@@ -1868,7 +1891,7 @@ static void lossStatsThreadFunc(void* context) {
         char periodicPingPayload[8];
 
         BbInitializeWrappedBuffer(&byteBuffer, periodicPingPayload, 0, sizeof(periodicPingPayload), BYTE_ORDER_LITTLE);
-        BbPut16(&byteBuffer, 4); // Length of payload
+        BbPut32(&byteBuffer, 4); // Length of payload
         BbPut32(&byteBuffer, 0); // Timestamp?
 
         while (!PltIsThreadInterrupted(&lossStatsThread)) {
@@ -2218,6 +2241,28 @@ int LiSendClipboardData(const void* payload, int length) {
     }
 
     return 0;
+}
+
+int LiRequestResolutionChange(int width, int height) {
+    uint32_t payload[3];
+
+    if (width <= 0 || height <= 0 || width > 16384 || height > 16384 ||
+            (width & 1) || (height & 1)) {
+        return -1;
+    }
+    if (!IS_SUNSHINE() || !encryptedControlStream || AppVersionQuad[0] < 5 ||
+            packetTypes == NULL || packetTypes[IDX_DYNAMIC_PARAM_CHANGE] == -1) {
+        return -2;
+    }
+    if (stopping || peer == NULL || peer->state != ENET_PEER_STATE_CONNECTED) {
+        return -3;
+    }
+
+    payload[0] = LE32(SS_DYNAMIC_PARAM_TYPE_RESOLUTION);
+    payload[1] = LE32((uint32_t)width);
+    payload[2] = LE32((uint32_t)height);
+    return sendMessageAndForget(packetTypes[IDX_DYNAMIC_PARAM_CHANGE], sizeof(payload), payload,
+                                CTRL_CHANNEL_GENERIC, ENET_PACKET_FLAG_RELIABLE, false) ? 0 : -4;
 }
 
 int LiSendClientSdrWhiteNits(float nits) {

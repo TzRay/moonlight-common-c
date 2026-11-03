@@ -276,12 +276,22 @@ static PSDP_OPTION getAttributesList(char*urlSafeAddr) {
         uint32_t moonlightFeatureFlags = ML_FF_FEC_STATUS | ML_FF_SESSION_ID_V1;
         if (ListenerCallbacks.ds5HapticsPcm != NULL) {
             moonlightFeatureFlags |= ML_FF_DS5_HAPTICS_PCM;
+            if (Ds5HapticsStateCallback != NULL) {
+                moonlightFeatureFlags |= ML_FF_DS5_HAPTICS_STATE;
+            }
         }
         if (ListenerCallbacks.ds5HapticsIrV2 != NULL) {
             moonlightFeatureFlags |= ML_FF_DS5_HAPTICS_IR_V2;
         }
+        if (ListenerCallbacks.ds5HapticsIrV2 != NULL && ListenerCallbacks.ds5HapticsIrExtended != NULL) {
+            // Enhancement is optional and requires the existing v2 base capability.
+            moonlightFeatureFlags |= ML_FF_DS5_HAPTICS_IR_EXTENDED;
+        }
         if (RemoteTextContextCallback != NULL) {
             moonlightFeatureFlags |= ML_FF_REMOTE_TEXT_CONTEXT;
+        }
+        if (HostSessionStateCallback != NULL) {
+            moonlightFeatureFlags |= ML_FF_HOST_SESSION_STATE;
         }
         if ((StreamConfig.supportedVideoFormats & VIDEO_FORMAT_PYROWAVE) != 0 &&
                 (VideoCallbacks.capabilities & CAPABILITY_PYROWAVE) != 0) {
@@ -587,8 +597,19 @@ static PSDP_OPTION getAttributesList(char*urlSafeAddr) {
         if (NegotiatedAudioCodec != AUDIO_CODEC_OPUS) {
             const char* codecStr = (NegotiatedAudioCodec == AUDIO_CODEC_AC3) ? "ac3" :
                                    (NegotiatedAudioCodec == AUDIO_CODEC_EAC3) ? "eac3" :
-                                   (NegotiatedAudioCodec == AUDIO_CODEC_PCM_S16) ? "pcm" : "opus";
+                                   (NegotiatedAudioCodec == AUDIO_CODEC_PCM_S16) ? "pcm" :
+                                   (NegotiatedAudioCodec == AUDIO_CODEC_MAT_LIVE) ? MAT_LIVE_NAME : "opus";
             err |= addAttributeString(&optionHead, "x-ml-audio.codec", codecStr);
+            if (AUDIO_CODEC_IS_MAT(NegotiatedAudioCodec)) {
+                err |= addAttributeString(&optionHead,"x-ml-audio.mat-live","1");
+                err |= addAttributeString(&optionHead,"x-ml-audio.mat-live-carrier",MAT_CARRIER);
+                err |= addAttributeString(&optionHead,"x-ml-audio.mat-live-clock",MAT_CLOCK);
+                err |= addAttributeString(&optionHead,"x-ml-audio.mat-live-crypto",MAT_LIVE_CRYPTO);
+                snprintf(payloadStr,sizeof(payloadStr),"%llu",(unsigned long long)MatLiveProfile.epoch);
+                err |= addAttributeString(&optionHead,"x-ml-audio.mat-live-epoch",payloadStr);
+                snprintf(payloadStr,sizeof(payloadStr),"%llu",(unsigned long long)MatLiveProfile.domain);
+                err |= addAttributeString(&optionHead,"x-ml-audio.mat-live-domain",payloadStr);
+            }
             if (NegotiatedAudioBitrate > 0) {
                 snprintf(payloadStr, sizeof(payloadStr), "%d", NegotiatedAudioBitrate);
                 err |= addAttributeString(&optionHead, "x-ml-audio.bitrate", payloadStr);
@@ -632,8 +653,10 @@ static PSDP_OPTION getAttributesList(char*urlSafeAddr) {
         if (NegotiatedAudioCodec == AUDIO_CODEC_AC3 || NegotiatedAudioCodec == AUDIO_CODEC_EAC3) {
             AudioPacketDuration = 32;
         }
-        // PCM passthrough: keep frames as small as possible. 5 ms @ 48 kHz =
-        // 240 samples, 7.1.4 = 5760 B which fits the 8 KB receive buffer.
+        else if (AUDIO_CODEC_IS_MAT(NegotiatedAudioCodec)) {
+            AudioPacketDuration = 1; // FEC transport tick; carrier PTS is in SMAT.
+        }
+        // PCM passthrough: 5 ms @ 48 kHz / 7.1.4 is 5760 B, within the 8 KB receive buffer.
         else if (NegotiatedAudioCodec == AUDIO_CODEC_PCM_S16) {
             AudioPacketDuration = 5;
         }

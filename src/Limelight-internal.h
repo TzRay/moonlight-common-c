@@ -1,6 +1,8 @@
 #pragma once
-
 #include "Platform.h"
+#include "MatLiveProfile.h"
+extern LI_MAT_LIVE_PROFILE MatLiveProfile;
+
 #include "Limelight.h"
 #include "PlatformSockets.h"
 #include "PlatformThreads.h"
@@ -13,6 +15,7 @@
 #include "PyrowaveReassembly.h"
 
 #include <enet/enet.h>
+#include <stdatomic.h>
 
 // Common globals
 extern char* RemoteAddrString;
@@ -26,7 +29,7 @@ extern ConnListenerRemoteTextContext RemoteTextContextCallback;
 extern DECODER_RENDERER_CALLBACKS VideoCallbacks;
 extern AUDIO_RENDERER_CALLBACKS AudioCallbacks;
 extern int NegotiatedVideoFormat;
-extern volatile bool ConnectionInterrupted;
+extern atomic_bool ConnectionInterrupted;
 extern bool HighQualitySurroundSupported;
 extern bool HighQualitySurroundEnabled;
 extern OPUS_MULTISTREAM_CONFIGURATION NormalQualityOpusConfig;
@@ -79,7 +82,6 @@ extern uint32_t EncryptionFeaturesEnabled;
 #define CTRL_CHANNEL_MOUSE        0x03
 #define CTRL_CHANNEL_PEN          0x04
 #define CTRL_CHANNEL_TOUCH        0x05
-#define CTRL_CHANNEL_UTF8         0x06
 #define CTRL_CHANNEL_GAMEPAD_BASE 0x10 // 0x10 to 0x1F by controller index
 #define CTRL_CHANNEL_SENSOR_BASE  0x20 // 0x20 to 0x2F by controller index
 #define CTRL_CHANNEL_COUNT        0x30
@@ -108,8 +110,13 @@ extern uint32_t EncryptionFeaturesEnabled;
 #define ML_FF_SESSION_ID_V1 0x02 // Client supports X-SS-Ping-Payload and X-SS-Connect-Data
 #define ML_FF_DS5_HAPTICS_PCM 0x04 // Client accepts authored DualSense PCM on the control stream
 #define ML_FF_DS5_HAPTICS_IR_V2 0x08 // Client selected simulated DualSense and accepts authored IR v2
+#define ML_FF_DS5_HAPTICS_IR_EXTENDED 0x80 // Client accepts continuous-state/source-event v2 IR enhancement (0x550B)
 #define ML_FF_REMOTE_TEXT_CONTEXT 0x10 // Client accepts remote text context updates
 #define ML_FF_PYROWAVE 0x20 // Client accepts the experimental PyroWave video contract
+#define ML_FF_DS5_HAPTICS_STATE 0x40 // Client accepts absolute DS5 actuator controls (0x550D)
+#define ML_FF_HOST_SESSION_STATE 0x100 // Client accepts host session lock state updates (0x550E)
+extern ConnListenerDs5HapticsState Ds5HapticsStateCallback;
+extern ConnListenerHostSessionState HostSessionStateCallback;
 
 #define UDP_RECV_POLL_TIMEOUT_MS 100
 
@@ -176,6 +183,8 @@ int initializeInputStream(void);
 void destroyInputStream(void);
 int startInputStream(void);
 int stopInputStream(void);
+// Only the control stream updates remote demand, before dispatching platform callbacks.
+int setControllerMotionEnabled(uint16_t controller, uint8_t type, bool enabled);
 
 int initializeMicrophoneStream(void);
 void destroyMicrophoneStream(void);
