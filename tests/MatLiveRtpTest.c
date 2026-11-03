@@ -30,15 +30,22 @@ int main(void){
  memcpy(carrier,"\x72\xf8\x1f\x4e\x16\x00\x02\x00",8);
  mat_wire_make(plain,MAT_WIRE_SYNC,123,7,0,0,0,NULL);uint64_t next=0;
  for(unsigned i=0;i<4;i++){CHECK(MatLiveSeal(&cipher,next,plain,wire));packet(next++,wire,sizeof(wire));}
- uint32_t hash=2166136261u;
+ uint32_t hash=2166136261u;uint8_t delayed[MAT_LIVE_PACKET];
  for(unsigned i=0;i<1300;i++){
   carrier[8]=(uint8_t)i;uint32_t h=mat_hash(carrier,sizeof(carrier));
-  for(unsigned j=0;j<60;j++){mat_wire_make(plain,MAT_WIRE_DATA,123,7,i,j,h,carrier);CHECK(MatLiveSeal(&cipher,next,plain,wire));packet(next++,wire,sizeof(wire));}
+  for(unsigned j=0;j<60;j++){
+   mat_wire_make(plain,MAT_WIRE_DATA,123,7,i,j,h,carrier);
+   uint64_t sequence=next++;CHECK(MatLiveSeal(&cipher,sequence,plain,wire));
+   // The last shard of the first data block arrives after the next block starts.
+   if(i==0&&j==3){memcpy(delayed,wire,sizeof(delayed));continue;}
+   packet(sequence,wire,sizeof(wire));
+   if(i==0&&j==4)packet(sequence-1,delayed,sizeof(delayed));
+  }
   hash=mat_hash_update(hash,carrier,sizeof(carrier));
  }
  mat_wire_make(plain,MAT_WIRE_END,123,7,1300,0,hash,NULL);
  for(unsigned i=0;i<4;i++){CHECK(MatLiveSeal(&cipher,next,plain,wire));packet(next++,wire,sizeof(wire));}
  CHECK(cycles==1300 && ends==1 && !terminated && lastSeq==(uint16_t)(next-1));
  MatLivePlaybackClose(matLive);matLive=NULL;RtpaCleanupQueue(&rtpAudioQueue);cleanupPlatform();
- if(failures)return 1;puts("PASS actual RTP queue / AudioStream: 78008 packets, RTP16 wrap, legacy CBC bypass, exact authenticated cycles and EOS");return 0;
+ if(failures)return 1;puts("PASS actual RTP queue / AudioStream: 78008 packets, first-block reordering, RTP16 wrap, legacy CBC bypass, exact authenticated cycles and EOS");return 0;
 }
