@@ -138,7 +138,10 @@ int notifyAudioPortNegotiationComplete(void) {
 
     // For GFE 3.22 compatibility, we must start the audio ping thread before the RTSP handshake.
     // It will not reply to our RTSP PLAY request until the audio ping has been received.
-    rtpSocket = bindUdpSocket(RemoteAddr.ss_family, &LocalAddr, AddrLen, 0, SOCK_QOS_TYPE_AUDIO);
+    // MAT carries about 41.5 Mbps including FEC. Preserve the initial carrier
+    // while the renderer starts instead of relying on an Opus-sized OS default.
+    int receiveBufferSize = AUDIO_CODEC_IS_MAT(NegotiatedAudioCodec) ? 1024 * 1024 : 0;
+    rtpSocket = bindUdpSocket(RemoteAddr.ss_family, &LocalAddr, AddrLen, receiveBufferSize, SOCK_QOS_TYPE_AUDIO);
     if (rtpSocket == INVALID_SOCKET) {
         return LastSocketFail();
     }
