@@ -520,14 +520,25 @@ static void handleMissingPackets(PRTP_AUDIO_QUEUE queue) {
         return;
     }
 
-    // If the packet we're waiting on precedes our earliest FEC block, a previous FEC block was completely lost.
-    // We should resynchronize immediately by advancing the queue state to play our oldest block next.
+    // If the packet we're waiting on precedes our earliest FEC block, a whole earlier block is missing.
+    // Concealment codecs can resynchronize immediately; MAT must first allow for reordering below.
     //
     // NB: We do NOT want to set allowDiscontinuity here, because that will result in playing back the entire
     // FEC block immediately but we've only received a single packet from that block. Worse still, when the
     // remaining packets from this block arrive, they will trigger the OOS detection and kick us out of fast
     // audio recovery mode.
     if (isBefore16(queue->nextRtpSequenceNumber, queue->blockHead->fecHeader.baseSequenceNumber)) {
+        // A whole MAT block can be reordered too. Keep the same bounded wait as
+        // a partial block before skipping data that the carrier cannot conceal.
+        if (AUDIO_CODEC_IS_MAT(NegotiatedAudioCodec)) {
+            uint64_t waitUs = PltGetMicroseconds() - queue->blockHead->queueTimeUs;
+            if (waitUs <= (uint64_t)(AudioPacketDuration * RTPA_DATA_SHARDS) + (RTPQ_OOS_WAIT_TIME_MS * 1000)) {
+                return;
+            }
+            Limelog("Live MAT whole-block gap expired (expected %u, next block %u, waited %llu us)\n",
+                    queue->nextRtpSequenceNumber, queue->blockHead->fecHeader.baseSequenceNumber,
+                    (unsigned long long)waitUs);
+        }
         queue->nextRtpSequenceNumber = queue->blockHead->fecHeader.baseSequenceNumber;
         queue->oldestRtpBaseSequenceNumber = queue->blockHead->fecHeader.baseSequenceNumber;
         return;
