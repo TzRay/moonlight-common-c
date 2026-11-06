@@ -1254,11 +1254,27 @@ int performRtspHandshake(PSERVER_INFORMATION serverInfo) {
     {
         RTSP_MESSAGE response;
         int error = -1;
+        const uint64_t matRetryDeadline = PltGetMillis() + 5000;
 
-        if (!requestDescribe(&response, &error)) {
-            Limelog("RTSP DESCRIBE request failed: %d\n", error);
-            ret = error;
-            goto Exit;
+        for (;;) {
+            if (!requestDescribe(&response, &error)) {
+                Limelog("RTSP DESCRIBE request failed: %d\n", error);
+                ret = error;
+                goto Exit;
+            }
+
+            // An abrupt reconnect can reach DESCRIBE before the previous
+            // control connection releases its exclusive live MAT source.
+            // Retry only this temporary response; keep the source exclusive
+            // and preserve every other handshake failure and codec check.
+            if (NegotiatedAudioCodec != AUDIO_CODEC_MAT_LIVE ||
+                    response.message.response.statusCode != 503 ||
+                    ConnectionInterrupted || PltGetMillis() >= matRetryDeadline) {
+                break;
+            }
+            Limelog("Live MAT source temporarily unavailable; retrying DESCRIBE\n");
+            freeMessage(&response);
+            PltSleepMs(RTSP_RETRY_DELAY_MS);
         }
 
         if (response.message.response.statusCode != 200) {

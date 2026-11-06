@@ -168,6 +168,17 @@ if (BUILD_TESTING)
 
   get_target_property(_common_c_type moonlight-common-c TYPE)
   if(_common_c_type STREQUAL "STATIC_LIBRARY")
+    add_executable(mat-rtsp-retry-tests tests/MatRtspRetryTest.c)
+    target_include_directories(mat-rtsp-retry-tests PRIVATE enet/include
+      $<TARGET_PROPERTY:moonlight-common-c,INCLUDE_DIRECTORIES>)
+    target_compile_definitions(mat-rtsp-retry-tests PRIVATE
+      $<TARGET_PROPERTY:moonlight-common-c,COMPILE_DEFINITIONS>)
+    target_compile_options(mat-rtsp-retry-tests PRIVATE
+      $<TARGET_PROPERTY:moonlight-common-c,COMPILE_OPTIONS>)
+    target_link_libraries(mat-rtsp-retry-tests PRIVATE moonlight-common-c)
+    add_test(NAME mat-rtsp-retry-tests COMMAND mat-rtsp-retry-tests)
+    set_tests_properties(mat-rtsp-retry-tests PROPERTIES TIMEOUT 25)
+
     add_executable(video-receive-error-tests tests/VideoReceiveErrorTest.c)
     target_include_directories(video-receive-error-tests PRIVATE src enet/include)
     target_compile_definitions(video-receive-error-tests PRIVATE LC_DEBUG HAS_SOCKLEN_T)
