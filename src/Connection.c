@@ -28,6 +28,9 @@ bool AudioEncryptionEnabled;
 bool ReferenceFrameInvalidationSupported;
 int NegotiatedAudioCodec;
 LI_MAT_LIVE_PROFILE MatLiveProfile;
+unsigned MatAudioRecoveryOffered;
+unsigned NegotiatedMatAudioRecovery;
+uint32_t NegotiatedMatAudioSsrc;
 int NegotiatedAudioBitrate;
 int NegotiatedDynamicHdrFormat;
 int NegotiatedDynamicHdrFallback;
@@ -341,6 +344,8 @@ int LiStartConnection(PSERVER_INFORMATION serverInfo, PSTREAM_CONFIGURATION stre
     // LiGetNegotiatedAudioCodec() to check what was actually selected.
     NegotiatedAudioCodec = AUDIO_CODEC_OPUS;
     NegotiatedAudioBitrate = 0;
+    MatAudioRecoveryOffered = false;
+    NegotiatedMatAudioRecovery = false;
     memset(&MatLiveProfile,0,sizeof(MatLiveProfile));
     switch (StreamConfig.audioCodec) {
         case AUDIO_CODEC_OPUS:

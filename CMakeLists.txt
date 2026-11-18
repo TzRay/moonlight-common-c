@@ -177,7 +177,29 @@ if (BUILD_TESTING)
       $<TARGET_PROPERTY:moonlight-common-c,COMPILE_OPTIONS>)
     target_link_libraries(mat-rtsp-retry-tests PRIVATE moonlight-common-c)
     add_test(NAME mat-rtsp-retry-tests COMMAND mat-rtsp-retry-tests)
-    set_tests_properties(mat-rtsp-retry-tests PROPERTIES TIMEOUT 25)
+    set_tests_properties(mat-rtsp-retry-tests PROPERTIES TIMEOUT 45)
+
+    add_executable(mat-recovery-negotiation-tests tests/MatRecoveryNegotiationTest.c)
+    target_include_directories(mat-recovery-negotiation-tests PRIVATE enet/include
+      $<TARGET_PROPERTY:moonlight-common-c,INCLUDE_DIRECTORIES>)
+    target_compile_definitions(mat-recovery-negotiation-tests PRIVATE
+      $<TARGET_PROPERTY:moonlight-common-c,COMPILE_DEFINITIONS>)
+    target_compile_options(mat-recovery-negotiation-tests PRIVATE
+      $<TARGET_PROPERTY:moonlight-common-c,COMPILE_OPTIONS>)
+    target_link_libraries(mat-recovery-negotiation-tests PRIVATE moonlight-common-c)
+    add_test(NAME mat-recovery-negotiation-tests COMMAND mat-recovery-negotiation-tests)
+    set_tests_properties(mat-recovery-negotiation-tests PROPERTIES TIMEOUT 25)
+
+    add_executable(mat-audio-recovery-tests tests/MatAudioRecoveryTest.c)
+    target_include_directories(mat-audio-recovery-tests PRIVATE enet/include
+      $<TARGET_PROPERTY:moonlight-common-c,INCLUDE_DIRECTORIES>)
+    target_compile_definitions(mat-audio-recovery-tests PRIVATE
+      $<TARGET_PROPERTY:moonlight-common-c,COMPILE_DEFINITIONS>)
+    target_compile_options(mat-audio-recovery-tests PRIVATE
+      $<TARGET_PROPERTY:moonlight-common-c,COMPILE_OPTIONS>)
+    target_link_libraries(mat-audio-recovery-tests PRIVATE moonlight-common-c)
+    add_test(NAME mat-audio-recovery-tests COMMAND mat-audio-recovery-tests)
+    set_tests_properties(mat-audio-recovery-tests PROPERTIES TIMEOUT 20)
 
     add_executable(video-receive-error-tests tests/VideoReceiveErrorTest.c)
     target_include_directories(video-receive-error-tests PRIVATE src enet/include)
@@ -190,11 +212,13 @@ if (BUILD_TESTING)
     endif()
     add_test(NAME video-receive-error-tests COMMAND video-receive-error-tests)
 
-    add_executable(mat-live-rtp-tests tests/MatLiveRtpTest.c)
+    # Compile the actual queue with LC_DEBUG, including in Release test builds.
+    # A definition on the fixture alone cannot cover the former Debug FEC mode.
+    add_executable(mat-live-rtp-tests tests/MatLiveRtpTest.c src/RtpAudioQueue.c)
     target_include_directories(mat-live-rtp-tests PRIVATE enet/include
       $<TARGET_PROPERTY:moonlight-common-c,INCLUDE_DIRECTORIES>)
     target_compile_definitions(mat-live-rtp-tests PRIVATE
-      $<TARGET_PROPERTY:moonlight-common-c,COMPILE_DEFINITIONS>)
+      LC_DEBUG $<TARGET_PROPERTY:moonlight-common-c,COMPILE_DEFINITIONS>)
     target_link_libraries(mat-live-rtp-tests PRIVATE moonlight-common-c)
     if(MSVC)
       target_compile_options(mat-live-rtp-tests PRIVATE /experimental:c11atomics)
@@ -204,6 +228,24 @@ if (BUILD_TESTING)
       target_link_libraries(mat-live-rtp-tests PRIVATE ${OPENSSL_CRYPTO_LIBRARY})
     endif()
     add_test(NAME mat-live-rtp-tests COMMAND mat-live-rtp-tests)
+    # Synthetic shard loss is isolated to an explicitly requested offline target.
+    option(BUILD_AUDIO_FEC_VALIDATION_TEST "Build the offline audio FEC self-test" OFF)
+    if(BUILD_AUDIO_FEC_VALIDATION_TEST)
+      add_executable(mat-fec-validation-tests tests/MatLiveRtpTest.c src/RtpAudioQueue.c)
+      target_include_directories(mat-fec-validation-tests PRIVATE enet/include
+        $<TARGET_PROPERTY:moonlight-common-c,INCLUDE_DIRECTORIES>)
+      target_compile_definitions(mat-fec-validation-tests PRIVATE LC_DEBUG LC_AUDIO_FEC_VALIDATION
+        $<TARGET_PROPERTY:moonlight-common-c,COMPILE_DEFINITIONS>)
+      target_link_libraries(mat-fec-validation-tests PRIVATE moonlight-common-c)
+      if(MSVC)
+        target_compile_options(mat-fec-validation-tests PRIVATE /experimental:c11atomics)
+      endif()
+      if(NOT USE_MBEDTLS)
+        target_include_directories(mat-fec-validation-tests SYSTEM PRIVATE ${OPENSSL_INCLUDE_DIR})
+        target_link_libraries(mat-fec-validation-tests PRIVATE ${OPENSSL_CRYPTO_LIBRARY})
+      endif()
+      add_test(NAME mat-fec-validation-tests COMMAND mat-fec-validation-tests)
+    endif()
     add_executable(audio-codec-selection-tests tests/AudioCodecSelectionTest.c)
     target_include_directories(audio-codec-selection-tests PRIVATE
       enet/include $<TARGET_PROPERTY:moonlight-common-c,INCLUDE_DIRECTORIES>)

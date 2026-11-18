@@ -3,6 +3,7 @@
 #include "MatLiveCrypto.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <time.h>
 static int failures,cycles,ends,reject;
 #define CHECK(x) do{if(!(x)){fprintf(stderr,"line %d: %s\n",__LINE__,#x);++failures;}}while(0)
 static int cycle(void* c,const uint8_t* b,int n,uint64_t e,uint64_t d,uint64_t i,uint64_t pts){
@@ -14,9 +15,41 @@ static LI_MAT_LIVE_PROFILE profile={123,7};
 static MAT_LIVE_CIPHER cipher;
 static MAT_LIVE_PLAYBACK* open_receiver(void){LI_MAT_PLAYBACK_CALLBACKS cb={0};cb.cycle=cycle;cb.end=end;cycles=ends=reject=0;return MatLivePlaybackOpen(&profile,key,&cb);}
 static int push(MAT_LIVE_PLAYBACK* receiver,uint64_t sequence){CHECK(MatLiveSeal(&cipher,sequence,plain,wire));return MatLivePlaybackPush(receiver,wire,sizeof(wire));}
+static void reusable_crypto(void){
+ MAT_LIVE_CRYPTO_CONTEXT tx={0},rx={0};uint8_t oldWire[MAT_LIVE_PACKET],newWire[MAT_LIVE_PACKET],decoded[MAT_WIRE_PACKET];
+ CHECK(MatLiveContextInit(&tx,&cipher,1));CHECK(MatLiveContextInit(&rx,&cipher,0));
+ for(unsigned i=0;i<256;i++){
+   uint64_t sequence=65408+i;for(unsigned j=0;j<sizeof(plain);j++)plain[j]=(uint8_t)(i+j);
+   CHECK(MatLiveSeal(&cipher,sequence,plain,oldWire));CHECK(MatLiveSealWithContext(&tx,sequence,plain,newWire));
+   CHECK(!memcmp(oldWire,newWire,sizeof(oldWire)));
+   CHECK(MatLiveOpenWithContext(&rx,sequence,oldWire,sizeof(oldWire),decoded));CHECK(!memcmp(plain,decoded,sizeof(plain)));
+   CHECK(MatLiveOpenPacket(&cipher,sequence,newWire,sizeof(newWire),decoded));CHECK(!memcmp(plain,decoded,sizeof(plain)));
+ }
+ newWire[sizeof(newWire)-1]^=1;memset(decoded,0x55,sizeof(decoded));
+ CHECK(!MatLiveOpenWithContext(&rx,65663,newWire,sizeof(newWire),decoded));
+ for(unsigned i=0;i<sizeof(decoded);i++)CHECK(!decoded[i]);
+ MatLiveContextDestroy(&tx);MatLiveContextDestroy(&rx);
+ /* Failed setup and repeated session teardown do not give the copyable key
+  * object ownership of a working EVP context. */
+ CHECK(!MatLiveContextInit(&tx,NULL,1));MatLiveContextDestroy(&tx);
+ for(unsigned i=0;i<32;i++){
+   MAT_LIVE_CIPHER independent=cipher;independent.key[0]^=(uint8_t)(i+1);
+   CHECK(MatLiveContextInit(&tx,&independent,1));CHECK(MatLiveContextInit(&rx,&independent,0));
+   CHECK(MatLiveSealWithContext(&tx,4,plain,newWire));CHECK(MatLiveOpenWithContext(&rx,4,newWire,sizeof(newWire),decoded));
+   CHECK(!memcmp(plain,decoded,sizeof(plain)));MatLiveContextDestroy(&tx);MatLiveContextDestroy(&rx);
+ }
+ CHECK(MatLiveContextInit(&tx,&cipher,1));
+ clock_t began=clock();for(unsigned i=0;i<12000;i++)CHECK(MatLiveSeal(&cipher,i,plain,oldWire));
+ double oldMs=1000.0*(clock()-began)/CLOCKS_PER_SEC;
+ began=clock();for(unsigned i=0;i<12000;i++)CHECK(MatLiveSealWithContext(&tx,i,plain,newWire));
+ double reusedMs=1000.0*(clock()-began)/CLOCKS_PER_SEC;
+ printf("MAT crypto 12000 packets: one-shot %.3f ms, reused %.3f ms (CPU time; not an audio latency measurement)\n",oldMs,reusedMs);
+ MatLiveContextDestroy(&tx);
+}
 int main(int argc,char** argv){
  for(unsigned i=0;i<16;i++)key[i]=(uint8_t)i;
  CHECK(MatLiveCipherInit(&cipher,key,16,123,7));
+ reusable_crypto();
  if(argc==2){for(unsigned i=0;i<MAT_WIRE_PACKET;i++)plain[i]=(uint8_t)i;CHECK(MatLiveSeal(&cipher,65536,plain,wire));FILE* f=fopen(argv[1],"wb");if(!f)return 2;fwrite(cipher.key,1,16,f);fwrite(wire,1,sizeof(wire),f);fclose(f);}
  memcpy(carrier,"\x72\xf8\x1f\x4e\x16\x00\x02\x00",8);
  MAT_LIVE_PLAYBACK* receiver=open_receiver();CHECK(receiver);uint32_t hash=2166136261u;uint64_t packet=4;
@@ -39,9 +72,9 @@ int main(int argc,char** argv){
    else CHECK(MatLiveSeal(&cipher,test==0?3:test==1?5:4,plain,wire));
    if(test==2)wire[32]^=1;if(test==3)wire[sizeof(wire)-1]^=1;if(test==4)wire[8]^=1;
    if(test==7){CHECK(MatLivePlaybackPush(receiver,wire,sizeof(wire))==0);}
-   CHECK(MatLivePlaybackPush(receiver,wire,sizeof(wire))<0);CHECK(MatLivePlaybackPush(receiver,wire,sizeof(wire))<0);CHECK(!cycles&&!ends);MatLivePlaybackClose(receiver);
+   CHECK(MatLivePlaybackPush(receiver,wire,sizeof(wire))<0);CHECK(MatLivePlaybackPush(receiver,wire,sizeof(wire))<0);CHECK(!cycles&&!ends);CHECK(MatLivePlaybackRecoveryBlocked(receiver));MatLivePlaybackClose(receiver);
  }
- receiver=open_receiver();reject=1;for(unsigned j=0;j<60;j++){mat_wire_make(plain,MAT_WIRE_DATA,123,7,0,j,mat_hash(carrier,sizeof(carrier)),carrier);CHECK(push(receiver,4+j)==(j==59?-1:0));}CHECK(cycles==1&&!ends);MatLivePlaybackClose(receiver);
+ receiver=open_receiver();reject=1;for(unsigned j=0;j<60;j++){mat_wire_make(plain,MAT_WIRE_DATA,123,7,0,j,mat_hash(carrier,sizeof(carrier)),carrier);CHECK(push(receiver,4+j)==(j==59?-1:0));}CHECK(cycles==1&&!ends);CHECK(!MatLivePlaybackRecoveryBlocked(receiver));MatLivePlaybackClose(receiver);
  uint64_t number;CHECK(!MatLiveDecimal("01",&number));CHECK(!MatLiveDecimal("0",&number));CHECK(!MatLiveDecimal("9223372036854775808",&number));CHECK(MatLiveDecimal("9223372036854775807",&number));
  if(failures)return 1;puts("PASS live MAT: 78000 authenticated data packets, RTP16 wrap, integrity/replay/gap/identity/EOF/callback failures");return 0;
 }

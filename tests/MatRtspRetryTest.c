@@ -43,6 +43,17 @@ static void serve(void* context) {
         else {
             CHECK(!strncmp(request, "OPTIONS ", 8));
         }
+        if (describe && status == 0) {
+            // A partial reply following a 503 must share the original deadline.
+            CHECK(send(client, "RTSP/", 5, 0) == 5);
+            if (peer->cancel) {
+                PltSleepMs(50);
+                ConnectionInterrupted = true;
+            }
+            while (!peer->stop) PltSleepMs(20);
+            closeSocket(client);
+            return;
+        }
         // A successful response with invalid SDP must still fail profile validation.
         const char* body = describe && status == 200 ? "v=0\r\n" : "";
         char response[512];
@@ -91,8 +102,8 @@ static void run(const char* name, int codec, int busyResponses, int finalStatus,
     closeSocket(peer.listener);
     CHECK(result == expectedResult);
     CHECK(peer.describes >= minRequests && peer.describes <= maxRequests);
-    CHECK(elapsed < (busyResponses == 100 ? 6500u : 2000u));
-    if (busyResponses == 100) CHECK(elapsed >= 5000);
+    if (busyResponses == 100 || (finalStatus == 0 && !cancel)) CHECK(elapsed >= 14950 && elapsed < 15400);
+    else CHECK(elapsed < 2000);
     printf("PASS %s: result=%d describes=%d elapsed=%llu ms\n", name, result,
            peer.describes, (unsigned long long)elapsed);
 }
@@ -109,7 +120,9 @@ int main(void) {
     StreamConfig.audioCodec = AUDIO_CODEC_MAT_LIVE;
     run("busy then different error", AUDIO_CODEC_MAT_LIVE, 2, 409, false, 409, 3, 3);
     run("busy then malformed SDP", AUDIO_CODEC_MAT_LIVE, 1, 200, false, -1, 2, 2);
-    run("permanent busy is bounded", AUDIO_CODEC_MAT_LIVE, 100, 503, false, 503, 2, 12);
+    run("permanent busy is bounded", AUDIO_CODEC_MAT_LIVE, 100, 503, false, 503, 2, 31);
+    run("late partial response shares deadline", AUDIO_CODEC_MAT_LIVE, 4, 0, false, ETIMEDOUT, 5, 5);
+    run("cancel during partial response", AUDIO_CODEC_MAT_LIVE, 0, 0, true, -1, 1, 1);
     run("Opus does not retry", AUDIO_CODEC_OPUS, 1, 409, false, 503, 1, 1);
     run("cancel while waiting", AUDIO_CODEC_MAT_LIVE, 1, 409, true, -1, 1, 1);
     cleanupPlatform();

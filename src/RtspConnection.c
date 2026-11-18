@@ -264,8 +264,27 @@ static bool unsealRtspMessage(char* rawMessage, int rawMessageLen, PRTSP_MESSAGE
     return success;
 }
 
+// A zero deadline preserves the ordinary RTSP transaction timeouts.
+static int remainingMs(uint64_t deadline, int limit) {
+    if (!deadline) return limit;
+    uint64_t now = PltGetMillis();
+    if (now >= deadline) return 0;
+    return deadline - now < (uint64_t)limit ? (int)(deadline - now) : limit;
+}
+
+static void sleepBeforeRetry(uint64_t deadline) {
+    if (!deadline) {
+        PltSleepMs(RTSP_RETRY_DELAY_MS);
+        return;
+    }
+    uint64_t until = PltGetMillis() + RTSP_RETRY_DELAY_MS;
+    if (until > deadline) until = deadline;
+    int delay;
+    while (!ConnectionInterrupted && (delay = remainingMs(until, 50)) > 0) PltSleepMs(delay);
+}
+
 // Send RTSP message and get response over ENet
-static bool transactRtspMessageEnet(PRTSP_MESSAGE request, PRTSP_MESSAGE response, bool expectingPayload, int* error) {
+static bool transactRtspMessageEnet(PRTSP_MESSAGE request, PRTSP_MESSAGE response, bool expectingPayload, int* error, uint64_t deadline) {
     ENetEvent event;
     char* serializedMessage;
     int messageLen;
@@ -326,7 +345,7 @@ static bool transactRtspMessageEnet(PRTSP_MESSAGE request, PRTSP_MESSAGE respons
     }
 
     // Wait for a reply
-    if (serviceEnetHost(client, &event, RTSP_RECEIVE_TIMEOUT_SEC * 1000) <= 0 ||
+    if (serviceEnetHost(client, &event, remainingMs(deadline, RTSP_RECEIVE_TIMEOUT_SEC * 1000)) <= 0 ||
         event.type != ENET_EVENT_TYPE_RECEIVE) {
         Limelog("Failed to receive RTSP reply: %d\n", LastSocketFail());
         goto Exit;
@@ -353,7 +372,7 @@ static bool transactRtspMessageEnet(PRTSP_MESSAGE request, PRTSP_MESSAGE respons
     // Wait for the payload if we're expecting some
     if (expectingPayload) {
         // The payload comes in a second packet
-        if (serviceEnetHost(client, &event, RTSP_RECEIVE_TIMEOUT_SEC * 1000) <= 0 ||
+        if (serviceEnetHost(client, &event, remainingMs(deadline, RTSP_RECEIVE_TIMEOUT_SEC * 1000)) <= 0 ||
             event.type != ENET_EVENT_TYPE_RECEIVE) {
             Limelog("Failed to receive RTSP reply payload: %d\n", LastSocketFail());
             goto Exit;
@@ -405,7 +424,7 @@ Exit:
 }
 
 // Send RTSP message and get response over TCP
-static bool transactRtspMessageTcp(PRTSP_MESSAGE request, PRTSP_MESSAGE response, int* error) {
+static bool transactRtspMessageTcp(PRTSP_MESSAGE request, PRTSP_MESSAGE response, int* error, uint64_t deadline) {
     SOCK_RET err;
     bool ret;
     int offset;
@@ -425,12 +444,17 @@ static bool transactRtspMessageTcp(PRTSP_MESSAGE request, PRTSP_MESSAGE response
     // returns HTTP 200 OK for the /launch request before the RTSP handshake port
     // is listening.
     do {
-        sock = connectTcpSocket(&RemoteAddr, AddrLen, RtspPortNumber, RTSP_CONNECT_TIMEOUT_SEC);
+        int timeout = remainingMs(deadline, RTSP_CONNECT_TIMEOUT_SEC * 1000);
+        if (!timeout) {
+            *error = ETIMEDOUT;
+            return false;
+        }
+        sock = connectTcpSocketMs(&RemoteAddr, AddrLen, RtspPortNumber, timeout);
         if (sock == INVALID_SOCKET) {
             *error = LastSocketError();
             if (*error == ECONNREFUSED) {
                 // Try again after 500 ms on ECONNREFUSED
-                PltSleepMs(RTSP_RETRY_DELAY_MS);
+                sleepBeforeRetry(deadline);
             }
             else {
                 // Fail if we get some other error
@@ -487,7 +511,13 @@ static bool transactRtspMessageTcp(PRTSP_MESSAGE request, PRTSP_MESSAGE response
 
         pfd.fd = sock;
         pfd.events = POLLIN;
-        err = pollSockets(&pfd, 1, RTSP_RECEIVE_TIMEOUT_SEC * 1000);
+        if (deadline && ConnectionInterrupted) {
+            *error = -1;
+            goto Exit;
+        }
+        int timeout = remainingMs(deadline, deadline ? 100 : RTSP_RECEIVE_TIMEOUT_SEC * 1000);
+        err = timeout ? pollSockets(&pfd, 1, timeout) : 0;
+        if (err == 0 && deadline && remainingMs(deadline, 1)) continue;
         if (err == 0) {
             *error = ETIMEDOUT;
             Limelog("RTSP request timed out\n");
@@ -538,18 +568,22 @@ Exit:
     return ret;
 }
 
-static bool transactRtspMessage(PRTSP_MESSAGE request, PRTSP_MESSAGE response, bool expectingPayload, int* error) {
+static bool transactRtspMessageUntil(PRTSP_MESSAGE request, PRTSP_MESSAGE response, bool expectingPayload, int* error, uint64_t deadline) {
     if (ConnectionInterrupted) {
         *error = -1;
         return false;
     }
 
     if (useEnet) {
-        return transactRtspMessageEnet(request, response, expectingPayload, error);
+        return transactRtspMessageEnet(request, response, expectingPayload, error, deadline);
     }
     else {
-        return transactRtspMessageTcp(request, response, error);
+        return transactRtspMessageTcp(request, response, error, deadline);
     }
+}
+
+static bool transactRtspMessage(PRTSP_MESSAGE request, PRTSP_MESSAGE response, bool expectingPayload, int* error) {
+    return transactRtspMessageUntil(request, response, expectingPayload, error, 0);
 }
 
 // Send RTSP OPTIONS request
@@ -569,7 +603,7 @@ static bool requestOptions(PRTSP_MESSAGE response, int* error) {
 }
 
 // Send RTSP DESCRIBE request
-static bool requestDescribe(PRTSP_MESSAGE response, int* error) {
+static bool requestDescribe(PRTSP_MESSAGE response, int* error, uint64_t deadline) {
     RTSP_MESSAGE request;
     bool ret;
 
@@ -582,7 +616,7 @@ static bool requestDescribe(PRTSP_MESSAGE response, int* error) {
             addOption(&request, "If-Modified-Since",
                 "Thu, 01 Jan 1970 00:00:00 GMT") &&
             (NegotiatedAudioCodec != AUDIO_CODEC_MAT_LIVE || addOption(&request,"X-ML-Mat-Live","1"))) {
-            ret = transactRtspMessage(&request, response, true, error);
+            ret = transactRtspMessageUntil(&request, response, true, error, deadline);
         }
         else {
             ret = false;
@@ -1137,6 +1171,8 @@ int performRtspHandshake(PSERVER_INFORMATION serverInfo) {
     hasSessionId = false;
     controlStreamId = APP_VERSION_AT_LEAST(7, 1, 431) ? "streamid=control/13/0" : "streamid=control/1/0";
     AudioEncryptionEnabled = false;
+    MatAudioRecoveryOffered = false;
+    NegotiatedMatAudioRecovery = false;
     MicPortNumber = 0;
     encryptedRtspEnabled = serverInfo->rtspSessionUrl && strstr(serverInfo->rtspSessionUrl, "rtspenc://");
     encryptionCtx = PltCreateCryptoContext();
@@ -1254,10 +1290,10 @@ int performRtspHandshake(PSERVER_INFORMATION serverInfo) {
     {
         RTSP_MESSAGE response;
         int error = -1;
-        const uint64_t matRetryDeadline = PltGetMillis() + 5000;
+        const uint64_t matRetryDeadline = NegotiatedAudioCodec == AUDIO_CODEC_MAT_LIVE ? PltGetMillis() + 15000 : 0;
 
         for (;;) {
-            if (!requestDescribe(&response, &error)) {
+            if (!requestDescribe(&response, &error, matRetryDeadline)) {
                 Limelog("RTSP DESCRIBE request failed: %d\n", error);
                 ret = error;
                 goto Exit;
@@ -1273,8 +1309,9 @@ int performRtspHandshake(PSERVER_INFORMATION serverInfo) {
                 break;
             }
             Limelog("Live MAT source temporarily unavailable; retrying DESCRIBE\n");
+            sleepBeforeRetry(matRetryDeadline);
+            if (!ConnectionInterrupted && !remainingMs(matRetryDeadline, 1)) break;
             freeMessage(&response);
-            PltSleepMs(RTSP_RETRY_DELAY_MS);
         }
 
         if (response.message.response.statusCode != 200) {
@@ -1434,6 +1471,18 @@ int performRtspHandshake(PSERVER_INFORMATION serverInfo) {
         }
         EncryptionFeaturesEnabled = 0;
 
+        char matRecoveryVersion[8];
+        NegotiatedMatAudioSsrc = 0;
+        MatAudioRecoveryOffered = IS_SUNSHINE() &&
+            NegotiatedAudioCodec == AUDIO_CODEC_MAT_LIVE &&
+            MatSdpValue(response.payload, "x-ss-audio.mat-live-recovery",
+                        matRecoveryVersion, sizeof(matRecoveryVersion)) == 1 &&
+            !strcmp(matRecoveryVersion, "1");
+        if (MatAudioRecoveryOffered &&
+            MatSdpValue(response.payload, "x-ss-audio.mat-live-recovery-v2",
+                        matRecoveryVersion, sizeof(matRecoveryVersion)) == 1 && !strcmp(matRecoveryVersion, "1"))
+            MatAudioRecoveryOffered = 2;
+
         // Parse the Opus surround parameters out of the RTSP DESCRIBE response.
         ret = parseOpusConfigurations(&response);
         if (ret != 0) {
@@ -1484,7 +1533,7 @@ int performRtspHandshake(PSERVER_INFORMATION serverInfo) {
 
             // Parse the Sunshine ping payload protocol extension if present
             memset(&AudioPingPayload, 0, sizeof(AudioPingPayload));
-            pingPayload = getOptionContent(response.options, "X-SS-Ping-Payload");
+            pingPayload = uniqueMatOption(response.options, "X-SS-Ping-Payload");
             if (pingPayload != NULL && strlen(pingPayload) == sizeof(AudioPingPayload.payload)) {
                 memcpy(AudioPingPayload.payload, pingPayload, sizeof(AudioPingPayload.payload));
             }
@@ -1714,7 +1763,8 @@ int performRtspHandshake(PSERVER_INFORMATION serverInfo) {
                 getOptionContent(response.options,"X-SS-Mat-Clock") ||
                 getOptionContent(response.options,"X-SS-Mat-Live-Epoch") ||
                 getOptionContent(response.options,"X-SS-Mat-Live-Domain") ||
-                getOptionContent(response.options,"X-SS-Mat-Live-Crypto")) {
+                getOptionContent(response.options,"X-SS-Mat-Live-Crypto") ||
+                getOptionContent(response.options,"X-SS-Mat-Live-Recovery")) {
                 Limelog("Unexpected codec/MAT confirmation after selecting Opus; refusing media\n");
                 ret = -1; freeMessage(&response); goto Exit;
             }
@@ -1727,6 +1777,34 @@ int performRtspHandshake(PSERVER_INFORMATION serverInfo) {
             uniqueMatOption(response.options,"X-SS-Mat-Live-Crypto"),uniqueMatOption(response.options,"X-SS-Mat-Live-Epoch"),
             uniqueMatOption(response.options,"X-SS-Mat-Live-Domain")))) {
             Limelog("Live MAT ANNOUNCE confirmation missing or mismatched\n");
+            ret=-1;freeMessage(&response);goto Exit;
+        }
+        const char* recoveryConfirmation = getOptionContent(response.options,"X-SS-Mat-Live-Recovery");
+        if (recoveryConfirmation != NULL) {
+            if (!MatAudioRecoveryOffered || NegotiatedAudioCodec != AUDIO_CODEC_MAT_LIVE ||
+                    !APP_VERSION_AT_LEAST(7, 1, 431) ||
+                    !(EncryptionFeaturesEnabled & SS_ENC_CONTROL_V2) || !AudioPingPayload.payload[0] ||
+                    !uniqueMatOption(response.options,"X-SS-Mat-Live-Recovery") ||
+                    strcmp(recoveryConfirmation, MatAudioRecoveryOffered == 2 ? "2" : "1")) {
+                Limelog("Unexpected or invalid MAT recovery confirmation\n");
+                ret=-1;freeMessage(&response);goto Exit;
+            }
+            if (MatAudioRecoveryOffered == 2) {
+                const char* ssrc = uniqueMatOption(response.options, "X-SS-Mat-Live-Ssrc");
+                uint64_t parsed = 0;
+                if (!ssrc || !MatLiveDecimal(ssrc, &parsed) || !parsed || parsed > UINT32_MAX) {
+                    Limelog("Invalid initial MAT SSRC confirmation\n");
+                    ret=-1;freeMessage(&response);goto Exit;
+                }
+                NegotiatedMatAudioSsrc = (uint32_t)parsed;
+            }
+            NegotiatedMatAudioRecovery = MatAudioRecoveryOffered;
+            Limelog("Negotiated MAT audio recovery v%u on the encrypted control stream\n", NegotiatedMatAudioRecovery);
+        }
+        if (recoveryConfirmation == NULL && MatAudioRecoveryOffered == 2 &&
+                NegotiatedAudioCodec == AUDIO_CODEC_MAT_LIVE && APP_VERSION_AT_LEAST(7, 1, 431) &&
+                (EncryptionFeaturesEnabled & SS_ENC_CONTROL_V2) && AudioPingPayload.payload[0]) {
+            Limelog("Missing selected MAT recovery v2 confirmation\n");
             ret=-1;freeMessage(&response);goto Exit;
         }
         if (!parseDynamicHdrNegotiation(&response)) {
@@ -1835,6 +1913,7 @@ int performRtspHandshake(PSERVER_INFORMATION serverInfo) {
     ret = 0;
 
 Exit:
+    if (ret != 0) NegotiatedMatAudioRecovery = false;
     // Cleanup the ENet stuff
     if (useEnet) {
         if (peer != NULL) {

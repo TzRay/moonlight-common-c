@@ -27,11 +27,11 @@ static void liveCallbacks(void) {
     MAT_LIVE_CIPHER cipher;
     LI_MAT_LIVE_PROFILE profile={1,1};
     CHECK(MatLiveCipherInit(&cipher,key,sizeof(key),1,1));
-    LI_MAT_PLAYBACK_CALLBACKS callbacks={consumeCycle,consumeEnd,NULL};
+    LI_MAT_PLAYBACK_CALLBACKS callbacks={consumeCycle,consumeEnd,NULL,NULL,NULL};
     LiSetMatPlaybackCallbacks(&callbacks);ListenerCallbacks.connectionTerminated=terminate;
     for(int test=0;test<4;test++) {
         received=ended=terminated=0;rejectCycle=test==1;rejectEnd=test==2;
-        matPlaybackFailedReported=matPlaybackCompleteReported=false;NegotiatedAudioCodec=AUDIO_CODEC_MAT_LIVE;
+        atomic_store(&matFailureReported,false);matPlaybackCompleteReported=false;NegotiatedAudioCodec=AUDIO_CODEC_MAT_LIVE;
         LI_MAT_PLAYBACK_CALLBACKS guarded=matCallbacks;guarded.end=matEnd;
         testNow=1000;atomic_store(&matInputEnded,false);atomic_store(&matLastAcceptedMs,testNow);
         matLive=MatLivePlaybackOpen(&profile,key,&guarded);CHECK(matLive!=NULL);

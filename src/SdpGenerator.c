@@ -609,6 +609,11 @@ static PSDP_OPTION getAttributesList(char*urlSafeAddr) {
                 err |= addAttributeString(&optionHead,"x-ml-audio.mat-live-epoch",payloadStr);
                 snprintf(payloadStr,sizeof(payloadStr),"%llu",(unsigned long long)MatLiveProfile.domain);
                 err |= addAttributeString(&optionHead,"x-ml-audio.mat-live-domain",payloadStr);
+                if (MatAudioRecoveryOffered && APP_VERSION_AT_LEAST(7, 1, 431) &&
+                        (EncryptionFeaturesEnabled & SS_ENC_CONTROL_V2) &&
+                        AudioPingPayload.payload[0] != 0) {
+                    err |= addAttributeString(&optionHead,"x-ml-audio.mat-live-recovery",MatAudioRecoveryOffered == 2 ? "2" : "1");
+                }
             }
             if (NegotiatedAudioBitrate > 0) {
                 snprintf(payloadStr, sizeof(payloadStr), "%d", NegotiatedAudioBitrate);

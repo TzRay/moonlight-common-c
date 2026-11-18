@@ -1759,6 +1759,23 @@ static void controlReceiveThreadFunc(void* context) {
                     Ds5HapticsStateCallback(controller, state);
                 }
             }
+            else if (ctlHdr->type == MAT_RECOVERY_PACKET_TYPE) {
+                MAT_AUDIO_RECOVERY recovery;
+                if (NegotiatedMatAudioRecovery && IS_SUNSHINE() && encryptedControlStream &&
+                        (EncryptionFeaturesEnabled & SS_ENC_CONTROL_V2) &&
+                        NegotiatedAudioCodec == AUDIO_CODEC_MAT_LIVE &&
+                        MatRecoveryDecode((const uint8_t*)(ctlHdr + 1),
+                                          packetLength - (int)sizeof(*ctlHdr), &recovery) &&
+                        MatRecoveryVersion(&recovery) == NegotiatedMatAudioRecovery &&
+                        (recovery.verb == MAT_RECOVERY_PREPARE ||
+                         recovery.verb == MAT_RECOVERY_START || recovery.verb == MAT_RECOVERY_FAIL)) {
+                    // The audio worker owns stop/join/rebuild. Never block this receiver.
+                    queueMatAudioRecoveryControl(&recovery);
+                }
+                else {
+                    Limelog("Discarding invalid or unnegotiated MAT recovery control packet\n");
+                }
+            }
             else if (ctlHdr->type == 0x550E) {
                 uint8_t sessionState;
                 if (HostSessionStateCallback != NULL && parseHostSessionState(
@@ -2213,6 +2230,32 @@ int sendInputPacketOnControlStream(unsigned char* data, int length, uint8_t chan
     }
 
     return 0;
+}
+
+// Called only by the audio recovery worker, outside the control receive thread.
+int sendMatAudioRecoveryControl(const MAT_AUDIO_RECOVERY* recovery) {
+    uint8_t payload[MAT_RECOVERY_V2_BYTES];
+    MAT_AUDIO_RECOVERY decoded;
+
+    if (recovery == NULL || (recovery->verb != MAT_RECOVERY_REQUEST &&
+            recovery->verb != MAT_RECOVERY_READY && recovery->verb != MAT_RECOVERY_FAIL &&
+            recovery->verb != MAT_RECOVERY_PLAYING && recovery->verb != MAT_RECOVERY_STABLE)) {
+        return -1;
+    }
+    MatRecoveryEncode(payload, recovery);
+    if (!MatRecoveryDecode(payload, MatRecoverySize(recovery), &decoded)) {
+        return -1;
+    }
+    if (MatRecoveryVersion(recovery) != NegotiatedMatAudioRecovery || NegotiatedAudioCodec != AUDIO_CODEC_MAT_LIVE ||
+            !IS_SUNSHINE() || !encryptedControlStream ||
+            !(EncryptionFeaturesEnabled & SS_ENC_CONTROL_V2)) {
+        return -2;
+    }
+    if (stopping || peer == NULL || peer->state != ENET_PEER_STATE_CONNECTED) {
+        return -3;
+    }
+    return sendMessageAndForget(MAT_RECOVERY_PACKET_TYPE, (int)MatRecoverySize(recovery), payload,
+                                CTRL_CHANNEL_GENERIC, ENET_PACKET_FLAG_RELIABLE, false) ? 0 : -4;
 }
 
 // Send a clipboard sync payload to the host. This is a Sunshine protocol extension

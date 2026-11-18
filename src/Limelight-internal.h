@@ -1,6 +1,7 @@
 #pragma once
 #include "Platform.h"
 #include "MatLiveProfile.h"
+#include "MatAudioRecovery.h"
 extern LI_MAT_LIVE_PROFILE MatLiveProfile;
 
 #include "Limelight.h"
@@ -40,6 +41,10 @@ extern bool ReferenceFrameInvalidationSupported;
 
 // Audio codec selected for this session (AUDIO_CODEC_*). Defaults to OPUS.
 extern int NegotiatedAudioCodec;
+// The DESCRIBE offer is distinct from the final ANNOUNCE confirmation.
+extern unsigned MatAudioRecoveryOffered;
+extern unsigned NegotiatedMatAudioRecovery;
+extern uint32_t NegotiatedMatAudioSsrc;
 // Dynamic HDR format/fallback negotiated in the RTSP ANNOUNCE response
 // (DYNAMIC_HDR_FORMAT_* / DYNAMIC_HDR_FALLBACK_*).
 extern int NegotiatedDynamicHdrFormat;
@@ -155,6 +160,9 @@ void connectionSendFrameFecStatus(PSS_FRAME_FEC_STATUS fecStatus);
 extern bool VideoFecControlSupported;
 void connectionRecordFecBlock(uint32_t frame, uint8_t block, uint16_t data, uint16_t received);
 int sendInputPacketOnControlStream(unsigned char* data, int length, uint8_t channelId, uint32_t flags, bool moreData);
+int sendMatAudioRecoveryControl(const MAT_AUDIO_RECOVERY* recovery);
+void queueMatAudioRecoveryControl(const MAT_AUDIO_RECOVERY* recovery);
+bool requestMatAudioRecovery(uint32_t reason);
 void flushInputOnControlStream(void);
 bool isControlDataInTransit(void);
 

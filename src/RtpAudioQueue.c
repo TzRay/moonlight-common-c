@@ -2,10 +2,10 @@
 
 #include <rs.h>
 
-#if defined(LC_DEBUG) && !defined(LC_FUZZING)
+#if defined(LC_AUDIO_FEC_VALIDATION) && !defined(LC_FUZZING)
 // This enables FEC validation mode with a synthetic drop
 // and recovered packet checks vs the original input. It
-// is on by default for debug builds.
+// is explicitly enabled only for offline validation, never by LC_DEBUG.
 //
 // NB: Unlike the video FEC feature of the same name, this
 // is much more restrictive in terms of when the validation
@@ -14,6 +14,9 @@
 // trigger the call to completeFecBlock(). Missing or OOO
 // packets will do the job.
 #define FEC_VALIDATION_MODE
+#endif
+
+#if defined(LC_DEBUG) && !defined(LC_FUZZING)
 #define FEC_VERBOSE
 #endif
 

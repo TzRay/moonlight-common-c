@@ -322,8 +322,17 @@ typedef struct {
     int (*cycle)(void*, const unsigned char*, int, uint64_t, uint64_t, uint64_t, uint64_t);
     int (*end)(void*, uint64_t);
     void* context;
+    // Optional, called once on each MAT audio worker before it starts work.
+    // Scheduling setup is best-effort and must not fail the stream.
+    void (*threadStart)(void*, int role);
+    // Current epoch/domain only: bit 0 = advancing playhead, bit 1 = stable
+    // playback; negative = renderer failure. Queried by the recovery owner.
+    int (*progress)(void*, uint64_t epoch, uint64_t domain);
 } LI_MAT_PLAYBACK_CALLBACKS;
+#define LI_MAT_THREAD_RECEIVE 0
+#define LI_MAT_THREAD_DECODE 1
 void LiSetMatPlaybackCallbacks(const LI_MAT_PLAYBACK_CALLBACKS* callbacks);
+void LiBlockMatAudioRecovery(void);
 
 // Bitmasks for STREAM_CONFIGURATION.supportedAudioCodecs (and reserved for a
 // future server-side capability advertisement). The set bit indicates that the

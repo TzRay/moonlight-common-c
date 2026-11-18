@@ -239,19 +239,18 @@ void closeSocket(SOCKET s) {
 #endif
 }
 
-// Registry of live streaming sockets for LiGetStreamSockets(). Each slot is
-// written once by its stream thread before LiStartConnection() returns and
-// cleared by LiStopConnection(), so plain volatile accesses suffice.
-static volatile SOCKET streamSocketRegistry[3];
+// Audio recovery can replace its socket after startup. Publish slot changes
+// atomically; an entry is cleared before its owning socket is closed.
+static _Atomic(SOCKET) streamSocketRegistry[3];
 
 void LiRecordStreamSocket(SOCKET s, int slot) {
     LC_ASSERT(slot >= 0 && slot < (int)(sizeof(streamSocketRegistry) / sizeof(streamSocketRegistry[0])));
-    streamSocketRegistry[slot] = s;
+    atomic_store(&streamSocketRegistry[slot], s);
 }
 
 void LiClearStreamSockets(void) {
     for (int i = 0; i < (int)(sizeof(streamSocketRegistry) / sizeof(streamSocketRegistry[0])); i++) {
-        streamSocketRegistry[i] = INVALID_SOCKET;
+        atomic_store(&streamSocketRegistry[i], INVALID_SOCKET);
     }
 }
 
@@ -263,7 +262,7 @@ void LiGetStreamSockets(LI_STREAM_SOCKETS* sockets) {
     const int slots[] = { STREAM_SOCKET_SLOT_VIDEO, STREAM_SOCKET_SLOT_AUDIO, STREAM_SOCKET_SLOT_CONTROL };
     LI_STREAM_SOCKET* out[] = { &sockets->videoRtp, &sockets->audioRtp, &sockets->control };
     for (int i = 0; i < (int)(sizeof(slots) / sizeof(slots[0])); i++) {
-        SOCKET s = streamSocketRegistry[slots[i]];
+        SOCKET s = atomic_load(&streamSocketRegistry[slots[i]]);
         if (s == INVALID_SOCKET) {
             continue;
         }
@@ -516,6 +515,10 @@ SOCKET createSocket(int addressFamily, int socketType, int protocol, bool nonBlo
 }
 
 SOCKET connectTcpSocket(struct sockaddr_storage* dstaddr, SOCKADDR_LEN addrlen, unsigned short port, int timeoutSec) {
+    return connectTcpSocketMs(dstaddr, addrlen, port, timeoutSec * 1000);
+}
+
+SOCKET connectTcpSocketMs(struct sockaddr_storage* dstaddr, SOCKADDR_LEN addrlen, unsigned short port, int timeoutMs) {
     SOCKET s;
     LC_SOCKADDR addr;
     struct pollfd pfd;
@@ -585,7 +588,7 @@ SOCKET connectTcpSocket(struct sockaddr_storage* dstaddr, SOCKADDR_LEN addrlen, 
     // Wait for the connection to complete or the timeout to elapse
     pfd.fd = s;
     pfd.events = POLLOUT;
-    err = pollSockets(&pfd, 1, timeoutSec * 1000);
+    err = pollSockets(&pfd, 1, timeoutMs);
     if (err < 0) {
         // pollSockets() failed
         err = LastSocketError();
@@ -596,7 +599,7 @@ SOCKET connectTcpSocket(struct sockaddr_storage* dstaddr, SOCKADDR_LEN addrlen, 
     }
     else if (err == 0) {
         // pollSockets() timed out
-        Limelog("Connection timed out after %d seconds (TCP port %u)\n", timeoutSec, port);
+        Limelog("Connection timed out after %d ms (TCP port %u)\n", timeoutMs, port);
         closeSocket(s);
         SetLastSocketError(ETIMEDOUT);
         return INVALID_SOCKET;

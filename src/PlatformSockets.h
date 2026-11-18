@@ -129,6 +129,7 @@ void LiRecordStreamSocket(SOCKET s, int slot);
 void LiClearStreamSockets(void);
 
 SOCKET createSocket(int addressFamily, int socketType, int protocol, bool nonBlocking);
+SOCKET connectTcpSocketMs(struct sockaddr_storage* dstaddr, SOCKADDR_LEN addrlen, unsigned short port, int timeoutMs);
 SOCKET connectTcpSocket(struct sockaddr_storage* dstaddr, SOCKADDR_LEN addrlen, unsigned short port, int timeoutSec);
 int getLocalAddressByUdpConnect(const struct sockaddr_storage* targetAddr, SOCKADDR_LEN targetAddrLen,  unsigned short targetPort,
                                 struct sockaddr_storage* localAddr, SOCKADDR_LEN* localAddrLen);
