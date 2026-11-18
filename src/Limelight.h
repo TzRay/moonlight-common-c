@@ -1311,6 +1311,11 @@ const RTP_VIDEO_STATS* LiGetRTPVideoStats(void);
 // active stream. The counter is reset when the video stream is initialized.
 uint64_t LiGetRTPVideoBytesReceived(void);
 
+// Cumulative native RTP data packets from observed video FEC blocks. The high
+// 32 bits are missing before recovery; the low 32 bits are expected. Both wrap
+// independently and reset on stream initialization. Entirely unseen blocks are excluded.
+uint64_t LiGetObservedVideoDataPackets(void);
+
 // Returns the percentage of video frames lost by the network during the most
 // recent connection-status sampling interval. Decoder and renderer drops are
 // not included. The value is updated every 3 seconds after the stream settles.

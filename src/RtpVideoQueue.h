@@ -34,6 +34,7 @@ typedef struct _RTP_VIDEO_QUEUE {
     uint32_t receivedHighestSequenceNumber;
     uint32_t fecPercentage;
     uint32_t nextContiguousSequenceNumber;
+    uint64_t pyrowaveReceivedData[16]; // Outer RTP shard indices are 10 bits.
     uint32_t missingPackets; // # of holes behind receivedHighestSequenceNumber
     bool useFastQueuePath;
     bool reportedLostFrame;

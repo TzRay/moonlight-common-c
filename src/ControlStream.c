@@ -90,6 +90,8 @@ static ENetPeer* peer;
 static PLT_MUTEX enetMutex;
 bool VideoFecControlSupported;
 static PLT_MUTEX fecSummaryMutex;
+// High word: missing data packets. Low word: expected data packets in observed blocks.
+static atomic_uint_least64_t observedVideoDataPackets;
 static uint32_t fecDataPackets, fecMissingPackets, fecSequence, fecLastFrame;
 static uint8_t fecLastBlock;
 static bool fecHasBlock;
@@ -595,6 +597,7 @@ int initializeControlStream(void) {
     PltCreateMutex(&enetMutex);
     PltCreateMutex(&fecSummaryMutex);
     fecDataPackets = fecMissingPackets = fecSequence = 0;
+    atomic_store_explicit(&observedVideoDataPackets, 0, memory_order_relaxed);
     fecHasBlock = false;
     fecLastSummaryMs = PltGetMillis();
 
@@ -749,17 +752,27 @@ void connectionReceivedCompleteFrame(uint32_t frameIndex, bool frameIsLTR) {
 }
 
 void connectionRecordFecBlock(uint32_t frame, uint8_t block, uint16_t data, uint16_t received) {
-    if (!VideoFecControlSupported || !data || received > data) return;
+    // Both RTP paths finalize blocks on the video receive thread.
+    if (!data || received > data || (fecHasBlock && frame == fecLastFrame && block == fecLastBlock)) return;
+    fecLastFrame = frame;
+    fecLastBlock = block;
+    fecHasBlock = true;
+    uint64_t previous = atomic_load_explicit(&observedVideoDataPackets, memory_order_relaxed);
+    uint32_t total = (uint32_t)previous + data;
+    uint32_t missing = (uint32_t)(previous >> 32) + (data - received);
+    atomic_store_explicit(&observedVideoDataPackets, ((uint64_t)missing << 32) | total, memory_order_relaxed);
+
+    if (!VideoFecControlSupported) return;
     PltLockMutex(&fecSummaryMutex);
-    if ((!fecHasBlock || frame != fecLastFrame || block != fecLastBlock) &&
-        data <= 1000000U - fecDataPackets) {
+    if (data <= 1000000U - fecDataPackets) {
         fecDataPackets += data;
         fecMissingPackets += data - received;
-        fecLastFrame = frame;
-        fecLastBlock = block;
-        fecHasBlock = true;
     }
     PltUnlockMutex(&fecSummaryMutex);
+}
+
+uint64_t LiGetObservedVideoDataPackets(void) {
+    return atomic_load_explicit(&observedVideoDataPackets, memory_order_relaxed);
 }
 
 void connectionSendFrameFecStatus(PSS_FRAME_FEC_STATUS fecStatus) {

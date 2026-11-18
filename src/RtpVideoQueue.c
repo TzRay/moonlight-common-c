@@ -562,6 +562,36 @@ uint32_t RtpvGetCurrentFrameNumber(PRTP_VIDEO_QUEUE queue) {
     return queue->currentFrameNumber;
 }
 
+// PyroWave bypasses the legacy FEC queue. Count its outer RTP shards without
+// delaying playback or treating an inner parity block as a lost data packet.
+static void observePyrowaveRtpPacket(PRTP_VIDEO_QUEUE queue, PNV_VIDEO_PACKET packet) {
+    uint16_t data = (uint16_t)(packet->fecInfo >> 22);
+    uint16_t index = (uint16_t)((packet->fecInfo >> 12) & 0x3ff);
+    uint8_t block = (packet->multiFecBlocks >> 4) & 3;
+    if (index >= data) return;
+    if (queue->currentFrameNumber == packet->frameIndex && block < queue->multiFecCurrentBlockNumber) return;
+
+    if (!queue->bufferDataPackets || queue->currentFrameNumber != packet->frameIndex || block != queue->multiFecCurrentBlockNumber) {
+        if (queue->receivedDataPackets < queue->bufferDataPackets) {
+            connectionRecordFecBlock(queue->currentFrameNumber, queue->multiFecCurrentBlockNumber,
+                                     queue->bufferDataPackets, queue->receivedDataPackets);
+        }
+        memset(queue->pyrowaveReceivedData, 0, sizeof(queue->pyrowaveReceivedData));
+        queue->bufferDataPackets = data;
+        queue->receivedDataPackets = 0;
+        queue->multiFecCurrentBlockNumber = block;
+    }
+    if (data != queue->bufferDataPackets) return;
+    uint64_t mask = UINT64_C(1) << (index % 64);
+    uint64_t* seen = &queue->pyrowaveReceivedData[index / 64];
+    if ((*seen & mask) == 0) {
+        *seen |= mask;
+        if (++queue->receivedDataPackets == data) {
+            connectionRecordFecBlock(packet->frameIndex, block, data, data);
+        }
+    }
+}
+
 int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_QUEUE_ENTRY packetEntry) {
     /* PyroWave reorders and recovers its inner blocks itself.  The legacy
        contiguous-sequence window is not advanced on this direct path, so
@@ -618,6 +648,7 @@ int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_
                 nvPacket->frameIndex != queue->currentFrameNumber) {
             connectionSawFrame(nvPacket->frameIndex);
         }
+        observePyrowaveRtpPacket(queue, nvPacket);
         queue->currentFrameNumber = nvPacket->frameIndex;
         packetEntry->next = NULL;
         packetEntry->prev = NULL;

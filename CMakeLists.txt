@@ -239,6 +239,14 @@ if (BUILD_TESTING)
     add_test(NAME mat-audio-recovery-tests COMMAND mat-audio-recovery-tests)
     set_tests_properties(mat-audio-recovery-tests PROPERTIES TIMEOUT 20)
 
+    add_executable(video-packet-stats-tests tests/VideoPacketStatsTest.c)
+    target_include_directories(video-packet-stats-tests PRIVATE enet/include
+      $<TARGET_PROPERTY:moonlight-common-c,INCLUDE_DIRECTORIES>)
+    target_compile_definitions(video-packet-stats-tests PRIVATE
+      $<TARGET_PROPERTY:moonlight-common-c,COMPILE_DEFINITIONS>)
+    target_link_libraries(video-packet-stats-tests PRIVATE moonlight-common-c)
+    add_test(NAME video-packet-stats-tests COMMAND video-packet-stats-tests)
+
     add_executable(video-receive-error-tests tests/VideoReceiveErrorTest.c)
     target_include_directories(video-receive-error-tests PRIVATE src enet/include)
     target_compile_definitions(video-receive-error-tests PRIVATE LC_DEBUG HAS_SOCKLEN_T)
