@@ -1,6 +1,6 @@
 // Exercise the real receive loop while clock/logging hooks deliberately clobber
 // the socket error. No socket or streaming peer is needed for this failure path.
-#define recvUdpSocket testRecvUdpSocket
+#define LiErClientRecv testEndpointRecv
 #define setNonFatalRecvTimeoutMs testSetRecvTimeout
 #define PltGetMicroseconds testClock
 #include "../src/VideoStream.c"
@@ -11,8 +11,8 @@
 
 static int socketError, terminationError, receives;
 
-int testRecvUdpSocket(SOCKET socket, char* buffer, int size, bool useSelect) {
-    (void)socket; (void)buffer; (void)size; (void)useSelect;
+int testEndpointRecv(LI_ENDPOINT_REFRESH* state, SOCKET* socket, char* buffer, int size, bool useSelect) {
+    (void)state; (void)socket; (void)buffer; (void)size; (void)useSelect;
     receives++;
     SetLastSocketError(socketError);
     return -1;

@@ -110,7 +110,9 @@ extern uint32_t EncryptionFeaturesEnabled;
 
 #define IS_SUNSHINE() (AppVersionQuad[3] < 0)
 
-// Client feature flags for x-ml-general.featureFlags SDP attribute
+// Client feature flags for x-ml-general.featureFlags SDP attribute.
+// Existing fork assignments are frozen. New fork-only features allocate from
+// 0x8000 downward; see docs/protocol-extension-registry.md.
 #define ML_FF_FEC_STATUS 0x01 // Client sends SS_FRAME_FEC_STATUS for frame losses
 #define ML_FF_SESSION_ID_V1 0x02 // Client supports X-SS-Ping-Payload and X-SS-Connect-Data
 #define ML_FF_DS5_HAPTICS_PCM 0x04 // Client accepts authored DualSense PCM on the control stream
@@ -122,6 +124,10 @@ extern uint32_t EncryptionFeaturesEnabled;
 #define ML_FF_HOST_SESSION_STATE 0x100 // Client accepts host session lock state updates (0x550E)
 extern ConnListenerDs5HapticsState Ds5HapticsStateCallback;
 extern ConnListenerHostSessionState HostSessionStateCallback;
+#define ML_FF_ENDPOINT_AUTO_REFRESH 0x8000 // Client requests authenticated endpoint migration v1
+#define ML_FF_BITRATE_CALLBACK 0x4000 // Reserved: client accepts host runtime bitrate updates on 0x5506 (not offered yet)
+extern bool EndpointRefreshRequested;
+void LiSetEndpointAutoRefreshEnabled(bool enabled);
 
 #define UDP_RECV_POLL_TIMEOUT_MS 100
 
@@ -170,7 +176,7 @@ int performRtspHandshake(PSERVER_INFORMATION serverInfo);
 
 void initializeVideoDepacketizer(int pktSize);
 void destroyVideoDepacketizer(void);
-void queueRtpPacket(PRTPV_QUEUE_ENTRY queueEntry);
+bool queueRtpPacket(PRTPV_QUEUE_ENTRY queueEntry);
 void stopVideoDepacketizer(void);
 void requestDecoderRefresh(void);
 void notifyFrameLost(unsigned int frameNumber, bool speculative);

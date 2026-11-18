@@ -1,4 +1,5 @@
 #include "Limelight-internal.h"
+#include <stdatomic.h>
 
 #define TEST_PORT_TIMEOUT_SEC 3
 
@@ -239,13 +240,18 @@ void closeSocket(SOCKET s) {
 #endif
 }
 
-// Audio recovery can replace its socket after startup. Publish slot changes
-// atomically; an entry is cleared before its owning socket is closed.
+// Receivers can replace a media socket while diagnostics or teardown run.
 static _Atomic(SOCKET) streamSocketRegistry[3];
 
 void LiRecordStreamSocket(SOCKET s, int slot) {
     LC_ASSERT(slot >= 0 && slot < (int)(sizeof(streamSocketRegistry) / sizeof(streamSocketRegistry[0])));
     atomic_store(&streamSocketRegistry[slot], s);
+}
+
+void LiReplaceStreamSocket(SOCKET previous, SOCKET replacement, int slot) {
+    LC_ASSERT(slot >= 0 && slot < (int)(sizeof(streamSocketRegistry) / sizeof(streamSocketRegistry[0])));
+    // Once teardown clears a slot, a concurrent migration must not republish it.
+    atomic_compare_exchange_strong(&streamSocketRegistry[slot], &previous, replacement);
 }
 
 void LiClearStreamSockets(void) {

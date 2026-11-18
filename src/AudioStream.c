@@ -1,4 +1,5 @@
 #include "Limelight-internal.h"
+#include "EndpointRefresh.h"
 #include "MatLivePlayback.h"
 #include "MatLiveCrypto.h"
 #include <stdatomic.h>
@@ -147,6 +148,7 @@ static void consumeAudio(char* data,int size) {
 }
 
 static SOCKET rtpSocket = INVALID_SOCKET;
+static LI_ENDPOINT_REFRESH endpointRefresh;
 
 static LINKED_BLOCKING_QUEUE packetQueue;
 static RTP_AUDIO_QUEUE rtpAudioQueue;
@@ -204,7 +206,10 @@ static void AudioPingThreadProc(void* context) {
     // to sending a packet prior to the host PC binding to that port.
     int pingCount = 0;
     while (!PltIsThreadInterrupted(&udpPingThread)) {
-        if (NegotiatedMatAudioRecovery || AudioPingPayload.payload[0] != 0) {
+        if (LiErClientPing(&endpointRefresh)) {
+            // Negotiated keepalive; audio may still be waiting for ANNOUNCE.
+        }
+        else if (NegotiatedMatAudioRecovery || AudioPingPayload.payload[0] != 0) {
             pingCount++;
             AudioPingPayload.sequenceNumber = BE32(pingCount);
 
@@ -270,6 +275,12 @@ static int initializeAudioGeneration(void) {
     return 0;
 }
 
+// Each recovered MAT generation has its own socket and authentication token.
+static bool initializeAudioEndpoint(void) {
+    return LiErClientInitialize(&endpointRefresh, rtpSocket, LI_ER_AUDIO,
+                                AudioPingPayload.payload, AudioPortNumber);
+}
+
 // This is called when the RTSP SETUP message is parsed and the audio port
 // number is parsed out of it. Alternatively, it's also called if parsing fails
 // and will use the well known audio port instead.
@@ -285,6 +296,11 @@ int notifyAudioPortNegotiationComplete(void) {
     rtpSocket = bindUdpSocket(RemoteAddr.ss_family, &LocalAddr, AddrLen, receiveBufferSize, SOCK_QOS_TYPE_AUDIO);
     if (rtpSocket == INVALID_SOCKET) {
         return LastSocketFail();
+    }
+    if (!initializeAudioEndpoint()) {
+        closeSocket(rtpSocket);
+        rtpSocket = INVALID_SOCKET;
+        return -1;
     }
     LiRecordStreamSocket(rtpSocket, STREAM_SOCKET_SLOT_AUDIO);
 
@@ -336,6 +352,7 @@ static void destroyAudioGeneration(void) {
         rtpSocket = INVALID_SOCKET;
     }
 
+    LiErClientDestroy(&endpointRefresh);
     PltDestroyCryptoContext(audioDecryptionCtx);
     audioDecryptionCtx = NULL;
     freePacketList(LbqDestroyLinkedBlockingQueue(&packetQueue));
@@ -393,7 +410,6 @@ static void decodeInputData(PQUEUED_AUDIO_PACKET packet) {
         consumeAudio(NULL, 0);
         return;
     }
-
     PRTP_PACKET rtp = (PRTP_PACKET)&packet->data[0];
     if (lastSeq != 0 && (unsigned short)(lastSeq + 1) != rtp->sequenceNumber) {
         if(AUDIO_CODEC_IS_MAT(NegotiatedAudioCodec)){
@@ -466,6 +482,10 @@ static void decodeInputData(PQUEUED_AUDIO_PACKET packet) {
 
         consumeAudio((char*)(rtp + 1), packet->header.size - sizeof(*rtp));
     }
+
+    // All media comes from the original UDP socket in the conservative
+    // recovery mode. Accepted audio refreshes endpoint health.
+    LiErClientMedia(&endpointRefresh);
 }
 
 static void AudioReceiveThreadProc(void* context) {
@@ -504,8 +524,15 @@ static void AudioReceiveThreadProc(void* context) {
             }
         }
 
-        packet->header.size = recvUdpSocket(rtpSocket, &packet->data[0], MAX_PACKET_SIZE, useSelect);
-        if (packet->header.size < 0) {
+        packet->header.size = LiErClientRecv(&endpointRefresh, &rtpSocket, &packet->data[0], MAX_PACKET_SIZE, useSelect);
+        if (packet->header.size == LI_ER_RECV_HANDLED) {
+            continue;
+        }
+        else if (packet->header.size == LI_ER_RECV_DEGRADED) {
+            Limelog("Audio endpoint is degraded; keeping the session alive\n");
+            continue;
+        }
+        else if (packet->header.size < 0) {
             if (AUDIO_CODEC_IS_MAT(NegotiatedAudioCodec)) reportMatFailure("receive_socket", &matReceiveDiagnostics, 0, 0, LastSocketFail());
             else { Limelog("Audio Receive: recvUdpSocket() failed: %d\n", (int)LastSocketError()); ListenerCallbacks.connectionTerminated(LastSocketFail()); }
             break;
@@ -1000,7 +1027,7 @@ static void MatRecoveryV2ThreadProc(void) {
             AudioPingPayload.sequenceNumber = 0;
             matRecoveryEpoch = message.newEpoch;
             matV2InstalledGeneration = message.generation;
-            if (!matV2Current(message.generation) ||
+            if (!initializeAudioEndpoint() || !matV2Current(message.generation) ||
                 prepareAudioGeneration(matAudioContext, matAudioFlags) != 0 ||
                 atomic_load(&matRecoveryBlocked) || PltGetMillis() >= deadline) {
                 matV2Fail(message.generation); continue;
@@ -1101,7 +1128,7 @@ static void MatRecoveryThreadProc(void* context) {
         AudioPortNumber = message.serverPort;
         memcpy(AudioPingPayload.payload, message.token, sizeof(message.token));
         AudioPingPayload.sequenceNumber = 0;
-        if (prepareAudioGeneration(matAudioContext, matAudioFlags) != 0 || recoveryCancelled()) goto failure;
+        if (!initializeAudioEndpoint() || prepareAudioGeneration(matAudioContext, matAudioFlags) != 0 || recoveryCancelled()) goto failure;
         PltLockMutex(&matRecoveryMutex);
         matRecoveryProfile.clientPort = message.clientPort;
         matRecoveryReady = true;

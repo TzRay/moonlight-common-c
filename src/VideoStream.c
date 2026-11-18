@@ -1,5 +1,6 @@
 #include "Limelight-internal.h"
 #include "VideoDiagnostics.h"
+#include "EndpointRefresh.h"
 
 #include <stdatomic.h>
 
@@ -11,6 +12,7 @@
 static RTP_VIDEO_QUEUE rtpQueue;
 
 static SOCKET rtpSocket = INVALID_SOCKET;
+static LI_ENDPOINT_REFRESH endpointRefresh;
 static SOCKET firstFrameSocket = INVALID_SOCKET;
 
 static PPLT_CRYPTO_CONTEXT decryptionCtx;
@@ -30,9 +32,25 @@ static bool videoNeedsDecoderThread(void) {
 }
 
 static bool receivedDataFromPeer;
-static uint64_t firstDataTimeMs;
+static uint64_t firstDataTimeMs, lastVideoDataTimeMs, firstVideoWaitStartMs;
 static bool receivedFullFrame;
 static _Atomic uint64_t rtpVideoBytesReceived;
+
+static bool videoTrafficTimedOut(uint64_t now) {
+    uint64_t lastActivityMs = receivedDataFromPeer ? lastVideoDataTimeMs : firstVideoWaitStartMs;
+    return lastActivityMs != 0 && now >= lastActivityMs &&
+           now - lastActivityMs >= FIRST_FRAME_TIMEOUT_SEC * 1000;
+}
+
+static bool terminateIfVideoTrafficTimedOut(void) {
+    if (!videoTrafficTimedOut(PltGetMillis())) {
+        return false;
+    }
+
+    Limelog("Terminating connection due to lack of video traffic\n");
+    ListenerCallbacks.connectionTerminated(ML_ERROR_NO_VIDEO_TRAFFIC);
+    return true;
+}
 
 // We can't request an IDR frame until the depacketizer knows
 // that a packet was lost. This timeout bounds the time that
@@ -52,7 +70,7 @@ void initializeVideoStream(void) {
     RtpvInitializeQueue(&rtpQueue);
     decryptionCtx = PltCreateCryptoContext();
     receivedDataFromPeer = false;
-    firstDataTimeMs = 0;
+    firstDataTimeMs = lastVideoDataTimeMs = firstVideoWaitStartMs = 0;
     receivedFullFrame = false;
     atomic_store_explicit(&rtpVideoBytesReceived, 0, memory_order_relaxed);
 }
@@ -60,6 +78,7 @@ void initializeVideoStream(void) {
 // Clean up the video stream
 void destroyVideoStream(void) {
     flushVideoDiagnostics();
+    LiErClientDestroy(&endpointRefresh);
     PltDestroyCryptoContext(decryptionCtx);
     destroyVideoDepacketizer();
     RtpvCleanupQueue(&rtpQueue);
@@ -81,7 +100,10 @@ static void VideoPingThreadProc(void* context) {
     // to sending a packet prior to the host PC binding to that port.
     int pingCount = 0;
     while (!PltIsThreadInterrupted(&udpPingThread)) {
-        if (VideoPingPayload.payload[0] != 0) {
+        if (LiErClientPing(&endpointRefresh)) {
+            // Authenticated keepalive from the original media socket.
+        }
+        else if (VideoPingPayload.payload[0] != 0) {
             pingCount++;
             VideoPingPayload.sequenceNumber = BE32(pingCount);
 
@@ -140,6 +162,7 @@ static void VideoReceiveThreadProc(void* context) {
     }
 
     waitingForVideoMs = 0;
+    firstVideoWaitStartMs = PltGetMillis();
     while (!PltIsThreadInterrupted(&receiveThread)) {
         PRTP_PACKET packet;
         uint64_t receiveStartUs = 0;
@@ -161,7 +184,7 @@ static void VideoReceiveThreadProc(void* context) {
         }
 
         if (timingEnabled) receiveStartUs = PltGetMicroseconds();
-        err = recvUdpSocket(rtpSocket,
+        err = LiErClientRecv(&endpointRefresh, &rtpSocket,
                             encrypted ? encryptedBuffer : buffer,
                             receiveSize,
                             useSelect);
@@ -171,21 +194,31 @@ static void VideoReceiveThreadProc(void* context) {
             receivedUs = PltGetMicroseconds();
             recordVideoTiming(VIDEO_TIMING_RECEIVE_WAIT, receiveStartUs, receivedUs);
         }
+        if (err == LI_ER_RECV_HANDLED) {
+            if (terminateIfVideoTrafficTimedOut()) {
+                break;
+            }
+            continue;
+        }
+        else if (err == LI_ER_RECV_DEGRADED) {
+            if (receivedDataFromPeer) {
+                Limelog("Video endpoint is degraded after the first frame\n");
+            }
+            // Keep the existing first-frame timeout and continue reading the
+            // original socket. A degraded probe is not a socket error.
+            if (terminateIfVideoTrafficTimedOut()) {
+                break;
+            }
+            continue;
+        }
         if (err < 0) {
             Limelog("Video Receive: recvUdpSocket() failed: %d\n", receiveError);
             ListenerCallbacks.connectionTerminated(receiveError != 0 ? receiveError : -1);
             break;
         }
         else if  (err == 0) {
-            if (!receivedDataFromPeer) {
-                // If we wait many seconds without ever receiving a video packet,
-                // assume something is broken and terminate the connection.
-                waitingForVideoMs += UDP_RECV_POLL_TIMEOUT_MS;
-                if (waitingForVideoMs >= FIRST_FRAME_TIMEOUT_SEC * 1000) {
-                    Limelog("Terminating connection due to lack of video traffic\n");
-                    ListenerCallbacks.connectionTerminated(ML_ERROR_NO_VIDEO_TRAFFIC);
-                    break;
-                }
+            if (terminateIfVideoTrafficTimedOut()) {
+                break;
             }
 
             // Receive timed out; try again
@@ -196,29 +229,16 @@ static void VideoReceiveThreadProc(void* context) {
         // the plaintext size. This is local accounting only; it does not
         // affect the RTP protocol or packet processing.
         const int receivedPacketLength = err;
+        const uint64_t packetTimeMs = PltGetMillis();
         atomic_fetch_add_explicit(&rtpVideoBytesReceived,
                                   (uint64_t)receivedPacketLength,
                                   memory_order_relaxed);
 
-        if (!receivedDataFromPeer) {
-            receivedDataFromPeer = true;
-            Limelog("Received first video packet after %d ms\n", waitingForVideoMs);
-
-            firstDataTimeMs = PltGetMillis();
-        }
-
-#ifndef LC_FUZZING
-        if (!receivedFullFrame) {
-            if (PltGetMillis() - firstDataTimeMs >= FIRST_FRAME_TIMEOUT_SEC * 1000) {
-                Limelog("Terminating connection due to lack of a successful video frame\n");
-                ListenerCallbacks.connectionTerminated(ML_ERROR_NO_VIDEO_FRAME);
-                break;
-            }
-        }
-#endif
-
         if (err < minSize) {
             // Runt packet
+            if (terminateIfVideoTrafficTimedOut()) {
+                break;
+            }
             continue;
         }
 
@@ -248,6 +268,9 @@ static void VideoReceiveThreadProc(void* context) {
             // traffic away (as mentioned in the paragraph above) and continue accepting
             // legitmate video traffic.
             if (encHeader->frameNumber && LE32(encHeader->frameNumber) < RtpvGetCurrentFrameNumber(&rtpQueue)) {
+                if (terminateIfVideoTrafficTimedOut()) {
+                    break;
+                }
                 continue;
             }
 
@@ -258,6 +281,9 @@ static void VideoReceiveThreadProc(void* context) {
                                    ((unsigned char*)(encHeader + 1)), err - sizeof(ENC_VIDEO_HEADER), // The ciphertext is after the header
                                    (unsigned char*)buffer, &err)) {
                 Limelog("Failed to decrypt video packet!\n");
+                if (terminateIfVideoTrafficTimedOut()) {
+                    break;
+                }
                 continue;
             }
         }
@@ -276,8 +302,43 @@ static void VideoReceiveThreadProc(void* context) {
         }
 
         if (queueStatus == RTPF_RET_QUEUED) {
-            // The queue owns the buffer
+            // RtpvAddPacket() has taken ownership of the buffer, even if the
+            // timeout checks below terminate the receive loop.
             buffer = NULL;
+
+            if (!receivedDataFromPeer) {
+                receivedDataFromPeer = true;
+                waitingForVideoMs = firstVideoWaitStartMs != 0 && packetTimeMs >= firstVideoWaitStartMs
+                    ? (int)(packetTimeMs - firstVideoWaitStartMs)
+                    : 0;
+                Limelog("Received first video packet after %d ms\n", waitingForVideoMs);
+
+                firstDataTimeMs = packetTimeMs;
+            }
+            lastVideoDataTimeMs = packetTimeMs;
+
+#ifndef LC_FUZZING
+            if (!receivedFullFrame &&
+                packetTimeMs - firstDataTimeMs >= FIRST_FRAME_TIMEOUT_SEC * 1000) {
+                Limelog("Terminating connection due to lack of a successful video frame\n");
+                ListenerCallbacks.connectionTerminated(ML_ERROR_NO_VIDEO_FRAME);
+                break;
+            }
+#endif
+
+            LiErClientMedia(&endpointRefresh);
+        }
+        else if (queueStatus == RTPF_RET_CONSUMED) {
+            // The depacketizer consumed and released the buffer, but the
+            // packet did not add new video data. Keep ownership in sync
+            // without refreshing the video watchdog.
+            buffer = NULL;
+            if (terminateIfVideoTrafficTimedOut()) {
+                break;
+            }
+        }
+        else if (terminateIfVideoTrafficTimedOut()) {
+            break;
         }
     }
 
@@ -384,6 +445,13 @@ int startVideoStream(void* rendererContext, int drFlags) {
         return LastSocketError();
     }
     LiRecordStreamSocket(rtpSocket, STREAM_SOCKET_SLOT_VIDEO);
+    if (!LiErClientInitialize(&endpointRefresh, rtpSocket, LI_ER_VIDEO, VideoPingPayload.payload,
+            VideoPortNumber)) {
+        closeSocket(rtpSocket);
+        rtpSocket = INVALID_SOCKET;
+        VideoCallbacks.cleanup();
+        return -1;
+    }
 
     VideoCallbacks.start();
 
