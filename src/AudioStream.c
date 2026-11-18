@@ -151,6 +151,10 @@ static SOCKET rtpSocket = INVALID_SOCKET;
 static LI_ENDPOINT_REFRESH endpointRefresh;
 
 static LINKED_BLOCKING_QUEUE packetQueue;
+// Only full receive buffers can go back to recv(). Reconstructed packets and
+// loss placeholders have variable-sized allocations owned by the FEC queue.
+static LINKED_BLOCKING_QUEUE matFreePackets;
+static bool matPoolReady;
 static RTP_AUDIO_QUEUE rtpAudioQueue;
 
 static PLT_THREAD udpPingThread;
@@ -183,6 +187,7 @@ static uint8_t opusHeaderByte;
 typedef struct _QUEUE_AUDIO_PACKET_HEADER {
     LINKED_BLOCKING_QUEUE_ENTRY lentry;
     int size;
+    bool reusable;
     uint64_t queuedAtUs;
 } QUEUED_AUDIO_PACKET_HEADER, *PQUEUED_AUDIO_PACKET_HEADER;
 
@@ -190,6 +195,26 @@ typedef struct _QUEUED_AUDIO_PACKET {
     QUEUED_AUDIO_PACKET_HEADER header;
     char data[MAX_PACKET_SIZE];
 } QUEUED_AUDIO_PACKET, *PQUEUED_AUDIO_PACKET;
+
+static PQUEUED_AUDIO_PACKET acquireReceivePacket(void) {
+    PQUEUED_AUDIO_PACKET packet;
+    if (matPoolReady && LbqPollQueueElement(&matFreePackets, (void**)&packet) == LBQ_SUCCESS) {
+        return packet;
+    }
+    packet = malloc(sizeof(*packet));
+    if (packet != NULL) {
+        packet->header.reusable = matPoolReady;
+    }
+    return packet;
+}
+
+static void releaseDecodedPacket(PQUEUED_AUDIO_PACKET_HEADER packet) {
+    if (packet->reusable &&
+        LbqOfferQueueItem(&matFreePackets, packet, &packet->lentry) == LBQ_SUCCESS) {
+        return;
+    }
+    free(packet);
+}
 
 static void AudioPingThreadProc(void* context) {
     char legacyPingData[] = { 0x50, 0x49, 0x4E, 0x47 };
@@ -356,6 +381,11 @@ static void destroyAudioGeneration(void) {
     PltDestroyCryptoContext(audioDecryptionCtx);
     audioDecryptionCtx = NULL;
     freePacketList(LbqDestroyLinkedBlockingQueue(&packetQueue));
+    if (matPoolReady) {
+        LbqSignalQueueShutdown(&matFreePackets);
+        freePacketList(LbqDestroyLinkedBlockingQueue(&matFreePackets));
+        matPoolReady = false;
+    }
     RtpaCleanupQueue(&rtpAudioQueue);
 }
 
@@ -516,7 +546,7 @@ static void AudioReceiveThreadProc(void* context) {
             reportMatFailure("validated_input_timeout", &matReceiveDiagnostics, 0, 0, -1);break;
         }
         if (packet == NULL) {
-            packet = (PQUEUED_AUDIO_PACKET)malloc(sizeof(*packet));
+            packet = acquireReceivePacket();
             if (packet == NULL) {
                 if (AUDIO_CODEC_IS_MAT(NegotiatedAudioCodec)) reportMatFailure("receive_allocate", &matReceiveDiagnostics, 0, 0, -1);
                 else { Limelog("Audio Receive: malloc() failed\n"); ListenerCallbacks.connectionTerminated(-1); }
@@ -627,6 +657,7 @@ static void AudioReceiveThreadProc(void* context) {
                 while ((queuedPacket = (PQUEUED_AUDIO_PACKET)RtpaGetQueuedPacket(&rtpAudioQueue, sizeof(QUEUED_AUDIO_PACKET_HEADER), &length)) != NULL) {
                     // Populate header data (not preserved in queued packets)
                     queuedPacket->header.size = length;
+                    queuedPacket->header.reusable = false;
 
                     if ((AudioCallbacks.capabilities & CAPABILITY_DIRECT_SUBMIT) == 0) {
                         if (!queuePacketToLbq(&queuedPacket)) {
@@ -677,7 +708,7 @@ static void AudioDecoderThreadProc(void* context) {
         }
         decodeInputData(packet);
 
-        free(packet);
+        releaseDecodedPacket(&packet->header);
     }
 }
 
@@ -760,6 +791,13 @@ static int prepareAudioGeneration(void* audioContext, int arFlags) {
 
     LC_ASSERT(packetQueue.currentSize == 0);
     packetQueue.sizeBound = AUDIO_CODEC_IS_MAT(NegotiatedAudioCodec) ? 512 : 30;
+    if (AUDIO_CODEC_IS_MAT(NegotiatedAudioCodec) && !matPoolReady) {
+        err = LbqInitializeLinkedBlockingQueue(&matFreePackets, packetQueue.sizeBound);
+        if (err != 0) {
+            return err;
+        }
+        matPoolReady = true;
+    }
     lastSeq = AUDIO_CODEC_IS_MAT(NegotiatedAudioCodec) ? 3 : 0;
 
     if (HighQualitySurroundEnabled) {

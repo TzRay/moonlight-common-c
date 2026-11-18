@@ -68,6 +68,20 @@ static int stopBeforeHardware(int configuration,const POPUS_MULTISTREAM_CONFIGUR
     CHECK(format->sampleRate==48000);
     CHECK(format->samplesPerFrame==(mat?960:240));
     CHECK(matLive==NULL);
+    CHECK(matPoolReady == (mat != 0));
+    if (mat) {
+        PQUEUED_AUDIO_PACKET first = acquireReceivePacket();
+        PQUEUED_AUDIO_PACKET second = acquireReceivePacket();
+        CHECK(first && second && first != second);
+        releaseDecodedPacket(&first->header);
+        CHECK(acquireReceivePacket() == first);
+        releaseDecodedPacket(&first->header);
+        releaseDecodedPacket(&second->header);
+        // A recovered shard can be smaller than the destination of recv().
+        PQUEUED_AUDIO_PACKET_HEADER gap = calloc(1, sizeof(*gap));
+        releaseDecodedPacket(gap);
+        CHECK(LbqGetItemCount(&matFreePackets) == 2);
+    }
     return -123;
 }
 int main(void) {
