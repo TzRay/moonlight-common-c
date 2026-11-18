@@ -10,6 +10,15 @@
 #define MAT_LIVE_TAG 16u
 #define MAT_LIVE_PACKET (MAT_LIVE_HEADER+MAT_WIRE_PACKET+MAT_LIVE_TAG)
 typedef struct { uint8_t key[16];uint64_t epoch,domain; } MAT_LIVE_CIPHER;
+/* The key/profile remains a copyable value. Working state belongs to one
+ * session and one direction, and must be destroyed before its cipher. */
+typedef struct {
+    const MAT_LIVE_CIPHER* cipher;
+    int encrypt;
+#if !defined(USE_MBEDTLS) && !defined(USE_PSA_CRYPTO)
+    EVP_CIPHER_CTX* evp;
+#endif
+} MAT_LIVE_CRYPTO_CONTEXT;
 static inline void MatLiveWipe(void* p,size_t n) { volatile uint8_t* b=(volatile uint8_t*)p;while(n--)*b++=0; }
 static inline int MatLiveHmac(const uint8_t* key,size_t size,const uint8_t* data,size_t length,uint8_t out[32]) {
 #if defined(USE_MBEDTLS) || defined(USE_PSA_CRYPTO)
@@ -94,4 +103,63 @@ static inline int MatLiveOpenPacket(const MAT_LIVE_CIPHER* c,uint64_t sequence,c
     EVP_CIPHER_CTX_free(ctx);if(okay)return 1;
 #endif
     MatLiveWipe(plain,MAT_WIRE_PACKET);return 0;
+}
+
+static inline void MatLiveContextDestroy(MAT_LIVE_CRYPTO_CONTEXT* context) {
+    if(!context)return;
+#if !defined(USE_MBEDTLS) && !defined(USE_PSA_CRYPTO)
+    EVP_CIPHER_CTX_free(context->evp);
+#endif
+    MatLiveWipe(context,sizeof(*context));
+}
+/* Initialize fresh/previously destroyed storage, never a live context. */
+static inline int MatLiveContextInit(MAT_LIVE_CRYPTO_CONTEXT* context,const MAT_LIVE_CIPHER* cipher,int encrypt) {
+    if(!context)return 0;
+    memset(context,0,sizeof(*context));
+    if(!cipher||!cipher->epoch)return 0;
+    context->cipher=cipher;context->encrypt=!!encrypt;
+#if !defined(USE_MBEDTLS) && !defined(USE_PSA_CRYPTO)
+    context->evp=EVP_CIPHER_CTX_new();
+    if(!context->evp ||
+        EVP_CipherInit_ex(context->evp,EVP_aes_128_gcm(),NULL,NULL,NULL,context->encrypt)!=1 ||
+        EVP_CIPHER_CTX_ctrl(context->evp,EVP_CTRL_GCM_SET_IVLEN,12,NULL)!=1 ||
+        EVP_CipherInit_ex(context->evp,NULL,NULL,cipher->key,NULL,context->encrypt)!=1) {
+        MatLiveContextDestroy(context);return 0;
+    }
+#endif
+    return 1;
+}
+static inline int MatLiveSealWithContext(MAT_LIVE_CRYPTO_CONTEXT* context,uint64_t sequence,
+        const uint8_t plain[MAT_WIRE_PACKET],uint8_t wire[MAT_LIVE_PACKET]) {
+    if(!context||!context->cipher||!context->encrypt||sequence>INT64_MAX)return 0;
+#if defined(USE_MBEDTLS) || defined(USE_PSA_CRYPTO)
+    return MatLiveSeal(context->cipher,sequence,plain,wire);
+#else
+    uint8_t nonce[12];int n=0,tail=0;MatLiveNonce(nonce,sequence);
+    memset(wire,0,MAT_LIVE_HEADER);memcpy(wire,"MLIV",4);wire[4]=1;wire[5]=MAT_LIVE_HEADER;
+    mat_put64(wire+8,context->cipher->epoch);mat_put64(wire+16,sequence);mat_put32(wire+24,MAT_WIRE_PACKET);
+    return EVP_EncryptInit_ex(context->evp,NULL,NULL,NULL,nonce)==1 &&
+        EVP_EncryptUpdate(context->evp,NULL,&n,wire,MAT_LIVE_HEADER)==1 &&
+        EVP_EncryptUpdate(context->evp,wire+MAT_LIVE_HEADER,&n,plain,MAT_WIRE_PACKET)==1 && n==MAT_WIRE_PACKET &&
+        EVP_EncryptFinal_ex(context->evp,wire+MAT_LIVE_HEADER+n,&tail)==1 && tail==0 &&
+        EVP_CIPHER_CTX_ctrl(context->evp,EVP_CTRL_GCM_GET_TAG,MAT_LIVE_TAG,wire+MAT_LIVE_HEADER+MAT_WIRE_PACKET)==1;
+#endif
+}
+static inline int MatLiveOpenWithContext(MAT_LIVE_CRYPTO_CONTEXT* context,uint64_t sequence,
+        const uint8_t* wire,size_t length,uint8_t plain[MAT_WIRE_PACKET]) {
+    if(!context||!context->cipher||context->encrypt)return 0;
+#if defined(USE_MBEDTLS) || defined(USE_PSA_CRYPTO)
+    return MatLiveOpenPacket(context->cipher,sequence,wire,length,plain);
+#else
+    uint8_t nonce[12];int n=0,tail=0;MatLiveNonce(nonce,sequence);
+    if(wire&&length==MAT_LIVE_PACKET&&!memcmp(wire,"MLIV",4)&&wire[4]==1&&wire[5]==MAT_LIVE_HEADER&&
+        !wire[6]&&!wire[7]&&mat_get64(wire+8)==context->cipher->epoch&&mat_get64(wire+16)==sequence&&
+        sequence<=INT64_MAX&&mat_get32(wire+24)==MAT_WIRE_PACKET&&!mat_get32(wire+28)&&
+        EVP_DecryptInit_ex(context->evp,NULL,NULL,NULL,nonce)==1 &&
+        EVP_DecryptUpdate(context->evp,NULL,&n,wire,MAT_LIVE_HEADER)==1 &&
+        EVP_DecryptUpdate(context->evp,plain,&n,wire+MAT_LIVE_HEADER,MAT_WIRE_PACKET)==1 && n==MAT_WIRE_PACKET &&
+        EVP_CIPHER_CTX_ctrl(context->evp,EVP_CTRL_GCM_SET_TAG,MAT_LIVE_TAG,(void*)(wire+MAT_LIVE_HEADER+MAT_WIRE_PACKET))==1 &&
+        EVP_DecryptFinal_ex(context->evp,plain+n,&tail)==1 && tail==0)return 1;
+    MatLiveWipe(plain,MAT_WIRE_PACKET);return 0;
+#endif
 }
