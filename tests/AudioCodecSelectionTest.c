@@ -38,11 +38,11 @@ static void liveCallbacks(void) {
         for(unsigned fragment=0;fragment<MAT_WIRE_FRAGMENTS;fragment++) {
             mat_wire_make(packet,MAT_WIRE_DATA,1,1,0,fragment,mat_hash(carrier,sizeof(carrier)),carrier);
             CHECK(MatLiveSeal(&cipher,4+fragment,packet,wire));
-            consumeAudio((char*)wire,sizeof(wire));
+            consumeAudio((char*)wire,sizeof(wire),0);
         }
         mat_wire_make(packet,MAT_WIRE_END,1,1,1,0,mat_hash(carrier,sizeof(carrier)),NULL);
         CHECK(MatLiveSeal(&cipher,64,packet,wire));
-        if(test!=3)consumeAudio((char*)wire,sizeof(wire));
+        if(test!=3)consumeAudio((char*)wire,sizeof(wire),0);
         else {testNow+=2000;CHECK(matInputTimedOut());CHECK(!atomic_load(&matInputEnded));}
         CHECK(received==1);CHECK(ended==(test==0||test==2));CHECK(terminated==(test==1||test==2));
         MatLivePlaybackClose(matLive);matLive=NULL;

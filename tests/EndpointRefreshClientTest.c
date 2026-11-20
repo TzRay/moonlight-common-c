@@ -90,7 +90,8 @@ int pollSockets(struct pollfd* fds, int count, int timeout) {
     }
     return result;
 }
-int recvUdpSocket(SOCKET socketValue, char* buffer, int size, bool useSelect) {
+int recvUdpSocketTimed(SOCKET socketValue, char* buffer, int size, bool useSelect, uint64_t* kernelUs) {
+    if (kernelUs) *kernelUs = 0;
     (void)useSelect;
     struct pollfd readable = { .fd = socketValue, .events = POLLIN };
     if (pollSockets(&readable, 1, 0) <= 0) {
