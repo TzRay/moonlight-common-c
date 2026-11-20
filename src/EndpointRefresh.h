@@ -30,6 +30,7 @@ bool LiErClientPing(LI_ENDPOINT_REFRESH* state);
 // whether a single media stream can degrade independently of the session.
 #define LI_ER_RECV_DEGRADED -4
 int LiErClientRecv(LI_ENDPOINT_REFRESH* state, SOCKET* socket, char* packet, int size, bool useSelect);
+int LiErClientRecvTimed(LI_ENDPOINT_REFRESH* state, SOCKET* socket, char* packet, int size, bool useSelect, uint64_t* kernelUs);
 void LiErClientMedia(LI_ENDPOINT_REFRESH* state);
 
 

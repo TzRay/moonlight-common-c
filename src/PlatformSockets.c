@@ -180,7 +180,52 @@ bool isSocketReadable(SOCKET s) {
     return true;
 }
 
+bool enableUdpReceiveTimestamps(SOCKET s) {
+#if defined(__ANDROID__) && defined(SO_TIMESTAMPNS)
+    int on = 1;
+    return setsockopt(s, SOL_SOCKET, SO_TIMESTAMPNS, &on, sizeof(on)) == 0;
+#else
+    (void)s;
+    return false;
+#endif
+}
+
+static int receiveDatagram(SOCKET s, char* buffer, int size, uint64_t* kernelUs) {
+#if defined(__ANDROID__) && defined(SO_TIMESTAMPNS)
+    if (kernelUs) {
+        union { struct cmsghdr align; char bytes[CMSG_SPACE(sizeof(struct timespec))]; } control;
+        struct iovec iov = { buffer, (size_t)size };
+        struct msghdr msg = {0};
+        msg.msg_iov = &iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = control.bytes;
+        msg.msg_controllen = sizeof(control.bytes);
+        int n = (int)recvmsg(s, &msg, 0);
+        if (n > 0 && !(msg.msg_flags & MSG_CTRUNC)) {
+            for (struct cmsghdr* c = CMSG_FIRSTHDR(&msg); c; c = CMSG_NXTHDR(&msg, c)) {
+                if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SO_TIMESTAMPNS &&
+                    c->cmsg_len == CMSG_LEN(sizeof(struct timespec))) {
+                    struct timespec t;
+                    memcpy(&t, CMSG_DATA(c), sizeof(t));
+                    *kernelUs = (uint64_t)t.tv_sec * 1000000 + t.tv_nsec / 1000;
+                    break;
+                }
+            }
+        }
+        return n;
+    }
+#else
+    (void)kernelUs;
+#endif
+    return (int)recvfrom(s, buffer, size, 0, NULL, NULL);
+}
+
 int recvUdpSocket(SOCKET s, char* buffer, int size, bool useSelect) {
+    return recvUdpSocketTimed(s, buffer, size, useSelect, NULL);
+}
+
+int recvUdpSocketTimed(SOCKET s, char* buffer, int size, bool useSelect, uint64_t* kernelUs) {
+    if (kernelUs) *kernelUs = 0;
     int err;
 
     do {
@@ -197,13 +242,13 @@ int recvUdpSocket(SOCKET s, char* buffer, int size, bool useSelect) {
             }
 
             // This won't block since the socket is readable
-            err = (int)recvfrom(s, buffer, size, 0, NULL, NULL);
+            err = receiveDatagram(s, buffer, size, kernelUs);
         }
         else {
             // The caller has already configured a timeout on this
             // socket via SO_RCVTIMEO, so we can avoid a syscall
             // for each packet.
-            err = (int)recvfrom(s, buffer, size, 0, NULL, NULL);
+            err = receiveDatagram(s, buffer, size, kernelUs);
             if (err < 0 &&
                     (LastSocketError() == EWOULDBLOCK ||
                      LastSocketError() == EINTR ||

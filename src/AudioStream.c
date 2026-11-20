@@ -70,8 +70,53 @@ typedef struct {
     uint64_t nextLogUs, packets, lastReceiveUs, maxReceiveGapUs;
     uint64_t maxQueueAgeUs, maxConsumeUs, consumeBuckets[4];
     unsigned peakQueue;
+    uint64_t lastKernelUs, kernelIntervals, missingKernelIntervals, maxKernelGapUs, lastCompleteUs;
+    uint16_t lastSequence;
+    uint8_t lastPayloadType;
+    // Cumulative per-generation gap histogram, 25 us buckets up to 64 ms.
+    uint64_t gapHistogram[2561];
+    uint64_t gapSamples;
 } MAT_AUDIO_DIAGNOSTICS;
 static MAT_AUDIO_DIAGNOSTICS matReceiveDiagnostics, matDecodeDiagnostics;
+static void recordMatGap(MAT_AUDIO_DIAGNOSTICS* d, uint64_t gap) {
+    unsigned bucket = gap >= 64000 ? 2560 : (unsigned)(gap / 25);
+    ++d->gapHistogram[bucket];
+    ++d->gapSamples;
+}
+
+static void recordMatArrival(MAT_AUDIO_DIAGNOSTICS* d, const RTP_PACKET* rtp, uint64_t now, uint64_t kernelUs) {
+    uint64_t gap = d->lastReceiveUs ? now - d->lastReceiveUs : 0;
+    bool haveKernelGap = kernelUs && d->lastKernelUs && kernelUs >= d->lastKernelUs;
+    uint64_t kernelGap = haveKernelGap ? kernelUs - d->lastKernelUs : 0;
+    if (d->lastReceiveUs) {
+        recordMatGap(d, gap);
+        if (haveKernelGap) ++d->kernelIntervals;
+        else ++d->missingKernelIntervals;
+        if (kernelGap > d->maxKernelGapUs) d->maxKernelGapUs = kernelGap;
+        if (gap > 50000 || kernelGap > 50000)
+            Limelog("MAT receive gap epoch=%llu prevRtp=%u/%u rtp=%u/%u appUs=%llu kernelUs=%lld pending=%u peakPending=%u\n",
+                (unsigned long long)MatLiveProfile.epoch, d->lastPayloadType, d->lastSequence,
+                rtp->packetType, BE16(rtp->sequenceNumber), (unsigned long long)gap,
+                haveKernelGap ? (long long)kernelGap : -1LL, atomic_load(&matPendingPackets), d->peakQueue);
+    }
+    d->lastSequence = BE16(rtp->sequenceNumber);
+    d->lastPayloadType = rtp->packetType;
+    d->lastKernelUs = kernelUs;
+    if (gap > d->maxReceiveGapUs) d->maxReceiveGapUs = gap;
+    d->lastReceiveUs = now;
+    ++d->packets;
+}
+
+static unsigned matGapP99(const MAT_AUDIO_DIAGNOSTICS* d) {
+    uint64_t wanted = d->gapSamples - d->gapSamples / 100;
+    if (!wanted) return 0;
+    for (unsigned i = 0; i < 2561; ++i) {
+        if (wanted <= d->gapHistogram[i]) return i * 25;
+        wanted -= d->gapHistogram[i];
+    }
+    return 64000;
+}
+
 static void logMatAudioDiagnostics(MAT_AUDIO_DIAGNOSTICS* d, const char* worker, bool force) {
     uint64_t now = PltGetMicroseconds();
     if (!force && now < d->nextLogUs) return;
@@ -84,6 +129,9 @@ static void logMatAudioDiagnostics(MAT_AUDIO_DIAGNOSTICS* d, const char* worker,
         (unsigned long long)d->consumeBuckets[1], (unsigned long long)d->consumeBuckets[2],
         (unsigned long long)d->consumeBuckets[3],
         (unsigned long long)atomic_load_explicit(&matSuppressedFailures, memory_order_relaxed));
+    Limelog("MAT gaps worker=%s samples=%llu p99FloorUs=%u kernelIntervals=%llu missingKernelIntervals=%llu maxKernelGapUs=%llu\n",
+        worker, (unsigned long long)d->gapSamples, matGapP99(d), (unsigned long long)d->kernelIntervals,
+        (unsigned long long)d->missingKernelIntervals, (unsigned long long)d->maxKernelGapUs);
     d->nextLogUs = now + 5000000;
     d->maxReceiveGapUs = d->maxQueueAgeUs = d->maxConsumeUs = 0;
     d->peakQueue = 0;
@@ -126,7 +174,7 @@ static bool matInputTimedOut(void) {
     return now>=last && now-last>=2000;
 }
 static void failMatInput(void) { MatLivePlaybackFail(matLive); }
-static void consumeAudio(char* data,int size) {
+static void consumeAudio(char* data,int size, uint64_t readyUs) {
     if(NegotiatedAudioCodec==AUDIO_CODEC_MAT_LIVE) {
         uint64_t started = PltGetMicroseconds();
         int result=MatLivePlaybackPush(matLive,(unsigned char*)data,(size_t)(size>0?size:0));
@@ -134,7 +182,12 @@ static void consumeAudio(char* data,int size) {
         ++matDecodeDiagnostics.packets;
         if (elapsed > matDecodeDiagnostics.maxConsumeUs) matDecodeDiagnostics.maxConsumeUs = elapsed;
         ++matDecodeDiagnostics.consumeBuckets[elapsed < 100 ? 0 : elapsed < 1000 ? 1 : elapsed < 10000 ? 2 : 3];
-        if(result==1)atomic_fetch_add_explicit(&matCompletedCycles,1,memory_order_relaxed);
+        if (result == 1) {
+            atomic_fetch_add_explicit(&matCompletedCycles, 1, memory_order_relaxed);
+            if (readyUs && matDecodeDiagnostics.lastCompleteUs && readyUs >= matDecodeDiagnostics.lastCompleteUs)
+                recordMatGap(&matDecodeDiagnostics, readyUs - matDecodeDiagnostics.lastCompleteUs);
+            matDecodeDiagnostics.lastCompleteUs = readyUs;
+        }
         if(result>=0)atomic_store_explicit(&matLastAcceptedMs,PltGetMillis(),memory_order_relaxed);
         if(result<0) {
             if(NegotiatedMatAudioRecovery==2 && MatLivePlaybackRecoveryBlocked(matLive)) LiBlockMatAudioRecovery();
@@ -395,7 +448,7 @@ static bool queuePacketToLbq(PQUEUED_AUDIO_PACKET* packet) {
     do {
         unsigned pending = 0;
         if (AUDIO_CODEC_IS_MAT(NegotiatedAudioCodec)) {
-            (*packet)->header.queuedAtUs = PltGetMicroseconds();
+            // queuedAtUs is the time this packet became deliverable.
             // Publish before offering: the decoder may take ownership immediately.
             pending = atomic_fetch_add_explicit(&matPendingPackets, 1, memory_order_relaxed) + 1;
         }
@@ -437,7 +490,7 @@ static void decodeInputData(PQUEUED_AUDIO_PACKET packet) {
             reportMatFailure("rtp_missing", &matDecodeDiagnostics, (unsigned short)(lastSeq + 1), 0, -1);
             return;
         }
-        consumeAudio(NULL, 0);
+        consumeAudio(NULL, 0, 0);
         return;
     }
     PRTP_PACKET rtp = (PRTP_PACKET)&packet->data[0];
@@ -473,7 +526,7 @@ static void decodeInputData(PQUEUED_AUDIO_PACKET packet) {
                                (unsigned char*)(rtp + 1), dataLength,
                                decryptedOpusData, &dataLength)) {
             Limelog("Failed to decrypt audio packet (sequence number: %u)\n", rtp->sequenceNumber);
-            if(AUDIO_CODEC_IS_MAT(NegotiatedAudioCodec)){failMatInput();consumeAudio(NULL,0);}
+            if(AUDIO_CODEC_IS_MAT(NegotiatedAudioCodec)){failMatInput();consumeAudio(NULL,0,0);}
             LC_ASSERT_VT(false);
             return;
         }
@@ -493,7 +546,7 @@ static void decodeInputData(PQUEUED_AUDIO_PACKET packet) {
         }
 #endif
 
-        consumeAudio((char*)decryptedOpusData, dataLength);
+        consumeAudio((char*)decryptedOpusData, dataLength, packet->header.queuedAtUs);
     }
     else {
 #ifdef LC_DEBUG
@@ -510,7 +563,7 @@ static void decodeInputData(PQUEUED_AUDIO_PACKET packet) {
         }
 #endif
 
-        consumeAudio((char*)(rtp + 1), packet->header.size - sizeof(*rtp));
+        consumeAudio((char*)(rtp + 1), packet->header.size - sizeof(*rtp), packet->header.queuedAtUs);
     }
 
     // All media comes from the original UDP socket in the conservative
@@ -528,6 +581,8 @@ static void AudioReceiveThreadProc(void* context) {
 
 
     startMatAudioWorker(LI_MAT_THREAD_RECEIVE);
+    bool mat = AUDIO_CODEC_IS_MAT(NegotiatedAudioCodec);
+    bool kernelTiming = mat && enableUdpReceiveTimestamps(rtpSocket);
     packet = NULL;
     packetsToDrop = AUDIO_CODEC_IS_MAT(NegotiatedAudioCodec)?0:500 / AudioPacketDuration;
 
@@ -554,7 +609,9 @@ static void AudioReceiveThreadProc(void* context) {
             }
         }
 
-        packet->header.size = LiErClientRecv(&endpointRefresh, &rtpSocket, &packet->data[0], MAX_PACKET_SIZE, useSelect);
+        uint64_t kernelUs = 0;
+        packet->header.size = LiErClientRecvTimed(&endpointRefresh, &rtpSocket, &packet->data[0], MAX_PACKET_SIZE, useSelect,
+                                                  kernelTiming ? &kernelUs : NULL);
         if (packet->header.size == LI_ER_RECV_HANDLED) {
             continue;
         }
@@ -591,12 +648,9 @@ static void AudioReceiveThreadProc(void* context) {
             atomic_fetch_add_explicit(&matRejectedRtp, 1, memory_order_relaxed);
             continue;
         }
-        if (AUDIO_CODEC_IS_MAT(NegotiatedAudioCodec)) {
-            uint64_t now = PltGetMicroseconds();
-            uint64_t gap = matReceiveDiagnostics.lastReceiveUs ? now - matReceiveDiagnostics.lastReceiveUs : 0;
-            if (gap > matReceiveDiagnostics.maxReceiveGapUs) matReceiveDiagnostics.maxReceiveGapUs = gap;
-            matReceiveDiagnostics.lastReceiveUs = now;
-            ++matReceiveDiagnostics.packets;
+        uint64_t receivedUs = mat ? PltGetMicroseconds() : 0;
+        if (mat) {
+            recordMatArrival(&matReceiveDiagnostics, rtp, receivedUs, kernelUs);
             logMatAudioDiagnostics(&matReceiveDiagnostics, "receive", false);
         }
 
@@ -628,6 +682,7 @@ static void AudioReceiveThreadProc(void* context) {
         rtp->timestamp = BE32(rtp->timestamp);
         rtp->ssrc = BE32(rtp->ssrc);
 
+        packet->header.queuedAtUs = receivedUs;
         queueStatus = RtpaAddPacket(&rtpAudioQueue, (PRTP_PACKET)&packet->data[0], (uint16_t)packet->header.size);
         if (RTPQ_HANDLE_NOW(queueStatus)) {
             if ((AudioCallbacks.capabilities & CAPABILITY_DIRECT_SUBMIT) == 0) {
@@ -658,6 +713,7 @@ static void AudioReceiveThreadProc(void* context) {
                     // Populate header data (not preserved in queued packets)
                     queuedPacket->header.size = length;
                     queuedPacket->header.reusable = false;
+                    queuedPacket->header.queuedAtUs = receivedUs;
 
                     if ((AudioCallbacks.capabilities & CAPABILITY_DIRECT_SUBMIT) == 0) {
                         if (!queuePacketToLbq(&queuedPacket)) {
