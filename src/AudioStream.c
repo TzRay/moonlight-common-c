@@ -73,7 +73,7 @@ typedef struct {
     uint64_t lastKernelUs, kernelIntervals, missingKernelIntervals, maxKernelGapUs, lastCompleteUs;
     uint16_t lastSequence;
     uint8_t lastPayloadType;
-    // Cumulative per-generation gap histogram, 25 us buckets up to 64 ms.
+    // Session totals follow the per-generation fields. 25 us buckets saturate at 64 ms.
     uint64_t gapHistogram[2561];
     uint64_t gapSamples;
 } MAT_AUDIO_DIAGNOSTICS;
@@ -335,8 +335,9 @@ static int initializeAudioGeneration(void) {
     atomic_store_explicit(&matSuppressedFailures,0,memory_order_relaxed);
     atomic_store(&matGenerationStopping, false);
     atomic_store(&matRejectedRtp, 0);
-    memset(&matReceiveDiagnostics,0,sizeof(matReceiveDiagnostics));
-    memset(&matDecodeDiagnostics,0,sizeof(matDecodeDiagnostics));
+    // A new socket has a new RTP sequence and kernel clock baseline. Keep the session histograms.
+    memset(&matReceiveDiagnostics, 0, offsetof(MAT_AUDIO_DIAGNOSTICS, gapHistogram));
+    memset(&matDecodeDiagnostics, 0, offsetof(MAT_AUDIO_DIAGNOSTICS, gapHistogram));
     matReceiveDiagnostics.nextLogUs = matDecodeDiagnostics.nextLogUs = PltGetMicroseconds() + 5000000;
     receivedDataFromPeer = false;
     pingThreadStarted = false;
@@ -1109,7 +1110,9 @@ static void MatRecoveryV2ThreadProc(void) {
                 closeSocket(nextSocket); matV2Fail(message.generation); continue;
             }
             destroyAudioGeneration();
-            initializeAudioGeneration();
+            memset(&matReceiveDiagnostics, 0, sizeof(matReceiveDiagnostics));
+    memset(&matDecodeDiagnostics, 0, sizeof(matDecodeDiagnostics));
+    initializeAudioGeneration();
             stopped = false;
             rtpSocket = nextSocket;
             LiRecordStreamSocket(rtpSocket, STREAM_SOCKET_SLOT_AUDIO);
