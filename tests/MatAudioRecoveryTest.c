@@ -134,7 +134,9 @@ static void setup(bool failRenderer) {
     memset(&NormalQualityOpusConfig,0,sizeof(NormalQualityOpusConfig));
     NormalQualityOpusConfig.sampleRate=48000;NormalQualityOpusConfig.channelCount=2;NormalQualityOpusConfig.streams=1;
     HighQualitySurroundEnabled=false;memset(&AudioPingPayload,0,sizeof(AudioPingPayload));AudioPingPayload.payload[15]=1;
-    CHECK(initializeAudioStream()==0);CHECK(notifyAudioPortNegotiationComplete()==0);
+    CHECK(initializeAudioStream()==0);
+    CHECK(!matReceiveDiagnostics.gapSamples && !matDecodeDiagnostics.gapSamples);
+    CHECK(notifyAudioPortNegotiationComplete()==0);
     oldPort=audioSocketPort(rtpSocket);CHECK(startAudioStream((void*)0x1234,17)==0);
 }
 static void teardown(void) {
@@ -222,7 +224,10 @@ static void repeatedV2WithOldPort(void) {
     sendCycle(third.clientPort,656);CHECK(awaitCount(&delivered,4));
     atomic_store(&progressEpoch,656);atomic_store(&progressValue,1);CHECK(awaitCount(&playingCount,3));
     CHECK(atomic_load(&initialized)==4&&!atomic_load(&terminated)&&!atomic_load(&failCount));
-    teardown();CHECK(atomic_load(&cleaned)==4);
+    teardown();
+    // Each of the four sockets received four sync packets and one full cycle.
+    CHECK(matReceiveDiagnostics.gapSamples == 4 * (4 + MAT_WIRE_FRAGMENTS - 1));
+    CHECK(matDecodeDiagnostics.gapSamples == 0);CHECK(atomic_load(&cleaned)==4);
 }
 static void failedV2CannotRevive(void) {
     setup(true);MAT_AUDIO_RECOVERY failed=v2Prepare(1,456);CHECK(awaitCount(&failCount,1));

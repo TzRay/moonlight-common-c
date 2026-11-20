@@ -319,6 +319,8 @@ int initializeAudioStream(void) {
     matV2InstalledGeneration = 0;
     matV2Report = matV2ResendReady = matV2Start = matV2PlayingSent = matV2StableSent = false;
     atomic_store(&matRecoveryBlocked, false);
+    memset(&matReceiveDiagnostics, 0, sizeof(matReceiveDiagnostics));
+    memset(&matDecodeDiagnostics, 0, sizeof(matDecodeDiagnostics));
     return initializeAudioGeneration();
 }
 
@@ -1110,9 +1112,7 @@ static void MatRecoveryV2ThreadProc(void) {
                 closeSocket(nextSocket); matV2Fail(message.generation); continue;
             }
             destroyAudioGeneration();
-            memset(&matReceiveDiagnostics, 0, sizeof(matReceiveDiagnostics));
-    memset(&matDecodeDiagnostics, 0, sizeof(matDecodeDiagnostics));
-    initializeAudioGeneration();
+            initializeAudioGeneration();
             stopped = false;
             rtpSocket = nextSocket;
             LiRecordStreamSocket(rtpSocket, STREAM_SOCKET_SLOT_AUDIO);
