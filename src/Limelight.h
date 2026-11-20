@@ -47,6 +47,7 @@ const char* LiGetLaunchUrlQueryParameters(void);
 // Client-local experiments. These flags never change RTSP/SDP or the host stream.
 #define VIDEO_RECEIVE_AVOID_CPU0   0x01
 #define VIDEO_RECEIVE_TIMING_STATS 0x02
+// Request large-frame interleaving only when offered by the Sunshine host.
 #define VIDEO_RECEIVE_INTERLEAVED_FEC 0x04
 
 typedef struct _STREAM_CONFIGURATION {
