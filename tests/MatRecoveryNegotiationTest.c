@@ -60,6 +60,9 @@ static void serve(void* context) {
         }
         else if (!strncmp(request, "ANNOUNCE ", 9)) {
             ++peer->announces;
+            bool interleave = (StreamConfig.videoReceiveOptions & VIDEO_RECEIVE_INTERLEAVED_FEC) &&
+                strstr(peer->offer, "a=x-ss-video[0].fecInterleaveVersion:1\r\n") != NULL;
+            CHECK((strstr(request, "a=x-ml-video.fecInterleaveVersion:1") != NULL) == interleave);
             CHECK(!NegotiatedMatAudioRecovery);
             char selection[64];snprintf(selection,sizeof(selection),"a=x-ml-audio.mat-live-recovery:%u",peer->expectedEcho);
             CHECK((strstr(request, "a=x-ml-audio.mat-live-recovery:") != NULL) == (peer->expectedEcho != 0));
@@ -155,6 +158,12 @@ int main(void) {
     run("no encrypted control v2", offer, "", false, true, true, false, 0, false);
     run("no session ping identity", offer, "", true, false, true, false, 0, false);
     run("Opus stays on legacy path", offer, "", true, true, false, false, 0, false);
+    const char* videoOffer = "a=x-ss-video[0].fecInterleaveVersion:1\r\n";
+    run("interleave off by default", videoOffer, "", true, true, false, 0, 0, 0);
+    StreamConfig.videoReceiveOptions |= VIDEO_RECEIVE_INTERLEAVED_FEC;
+    run("interleave negotiated", videoOffer, "", true, true, false, 0, 0, 0);
+    run("old host with interleave enabled", "", "", true, true, false, 0, 0, 0);
+    StreamConfig.videoReceiveOptions &= ~VIDEO_RECEIVE_INTERLEAVED_FEC;
     const char* both="a=x-ss-audio.mat-live-recovery:1\r\na=x-ss-audio.mat-live-recovery-v2:1\r\n";
 #ifdef MAT_RECOVERY_LEGACY_CLIENT
     run("legacy client with new host",both,confirmation,true,true,true,1,0,1);

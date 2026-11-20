@@ -412,6 +412,9 @@ static PSDP_OPTION getAttributesList(char*urlSafeAddr) {
         err |= addAttributeString(&optionHead, "x-ml-video.fecPercentage", payloadStr);
         err |= addAttributeString(&optionHead, "x-ml-video.fecSummaryVersion", "1");
     }
+    if (VideoFecInterleavingEnabled) {
+        err |= addAttributeString(&optionHead, "x-ml-video.fecInterleaveVersion", "1");
+    }
 
     err |= addAttributeString(&optionHead, "x-nv-video[0].rateControlMode", "4");
 

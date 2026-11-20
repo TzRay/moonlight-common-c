@@ -28,6 +28,7 @@ static char* uniqueMatOption(POPTION_ITEM options,const char* name) {
 #define MAX_RTSP_RESPONSE_SIZE (1024 * 1024)
 
 static int currentSeqNumber;
+bool VideoFecInterleavingEnabled;
 static char rtspTargetUrl[256];
 static char* sessionIdString;
 static bool hasSessionId;
@@ -1491,6 +1492,11 @@ int performRtspHandshake(PSERVER_INFORMATION serverInfo) {
         uint32_t fecVersion = 0;
         VideoFecControlSupported = IS_SUNSHINE() && NegotiatedVideoFormat != VIDEO_FORMAT_PYROWAVE &&
             parseSdpAttributeToUInt(response.payload, "x-ss-video[0].fecControlVersion", &fecVersion) && fecVersion == 1;
+        uint32_t interleaveVersion = 0;
+        VideoFecInterleavingEnabled = (StreamConfig.videoReceiveOptions & VIDEO_RECEIVE_INTERLEAVED_FEC) &&
+            IS_SUNSHINE() && NegotiatedVideoFormat != VIDEO_FORMAT_PYROWAVE &&
+            parseSdpAttributeToUInt(response.payload, "x-ss-video[0].fecInterleaveVersion", &interleaveVersion) &&
+            interleaveVersion == 1;
 
         // Look for the Sunshine feature flags in the SDP attributes
         if (!parseSdpAttributeToUInt(response.payload, "x-ss-general.featureFlags", &SunshineFeatureFlags)) {

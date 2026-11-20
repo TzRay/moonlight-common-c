@@ -22,6 +22,7 @@ typedef struct _RTPV_QUEUE_LIST {
 typedef struct _RTP_VIDEO_QUEUE {
     RTPV_QUEUE_LIST pendingFecBlockList;
     RTPV_QUEUE_LIST completedFecBlockList;
+    struct _INTERLEAVED_FRAME* interleaved;
 
     uint64_t bufferFirstRecvTimeUs;
     uint32_t bufferLowestSequenceNumber;

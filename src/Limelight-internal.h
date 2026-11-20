@@ -164,6 +164,7 @@ void connectionReceivedCompleteFrame(uint32_t frameIndex, bool frameIsLTR);
 void connectionSawFrame(uint32_t frameIndex);
 void connectionSendFrameFecStatus(PSS_FRAME_FEC_STATUS fecStatus);
 extern bool VideoFecControlSupported;
+extern bool VideoFecInterleavingEnabled;
 void connectionRecordFecBlock(uint32_t frame, uint8_t block, uint16_t data, uint16_t received);
 int sendInputPacketOnControlStream(unsigned char* data, int length, uint8_t channelId, uint32_t flags, bool moreData);
 int sendMatAudioRecoveryControl(const MAT_AUDIO_RECOVERY* recovery);

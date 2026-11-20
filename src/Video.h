@@ -24,6 +24,11 @@ typedef struct _ENC_VIDEO_HEADER {
 
 #define NV_VIDEO_PACKET_EXTRA_FLAG_LTR_FRAME 0x1
 
+// Negotiated fecInterleaveVersion 1. Logical RTP numbers and RS indices stay
+// contiguous within each block. On marked packets the low four multiFecBlocks
+// bits identify the blocks whose final original shard has been sent.
+#define SS_FEC_INFO_INTERLEAVED 0x1U
+
 typedef struct _NV_VIDEO_PACKET {
     uint32_t streamPacketIndex;
     uint32_t frameIndex;

@@ -18,6 +18,21 @@
 // RTP packets use a 90 KHz presentation timestamp clock
 #define PTS_DIVISOR 90
 
+// The negotiated wire format retains the four legacy RS blocks, each with
+// at most 255 shards. Packet storage stays with the receive buffer owner.
+typedef struct {
+    PRTPV_QUEUE_ENTRY shards[255];
+    uint16_t baseSequence;
+    uint8_t data, parity, receivedData, received;
+} INTERLEAVED_BLOCK;
+
+typedef struct _INTERLEAVED_FRAME {
+    uint32_t number, timestamp;
+    uint64_t firstRecvTimeUs;
+    uint8_t count, nextBlock, finishedData;
+    INTERLEAVED_BLOCK blocks[4];
+} INTERLEAVED_FRAME;
+
 void RtpvInitializeQueue(PRTP_VIDEO_QUEUE queue) {
     reed_solomon_init();
     memset(queue, 0, sizeof(*queue));
@@ -38,6 +53,17 @@ static void purgeListEntries(PRTPV_QUEUE_LIST list) {
 }
 
 void RtpvCleanupQueue(PRTP_VIDEO_QUEUE queue) {
+    if (queue->interleaved != NULL) {
+        INTERLEAVED_FRAME* frame = queue->interleaved;
+        for (unsigned g = frame->nextBlock; g < frame->count; g++) {
+            INTERLEAVED_BLOCK* block = &frame->blocks[g];
+            for (unsigned i = 0; i < block->data + block->parity; i++) {
+                if (block->shards[i] != NULL) free(block->shards[i]->packet);
+            }
+        }
+        free(frame);
+        queue->interleaved = NULL;
+    }
     purgeListEntries(&queue->pendingFecBlockList);
     purgeListEntries(&queue->completedFecBlockList);
 }
@@ -559,6 +585,7 @@ static void submitCompletedFrame(PRTP_VIDEO_QUEUE queue) {
 }
 
 uint32_t RtpvGetCurrentFrameNumber(PRTP_VIDEO_QUEUE queue) {
+    if (queue->interleaved != NULL && queue->interleaved->count) return queue->interleaved->number;
     return queue->currentFrameNumber;
 }
 
@@ -592,12 +619,13 @@ static void observePyrowaveRtpPacket(PRTP_VIDEO_QUEUE queue, PNV_VIDEO_PACKET pa
     }
 }
 
-int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_QUEUE_ENTRY packetEntry) {
+static int addSequentialPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length,
+                               PRTPV_QUEUE_ENTRY packetEntry, uint64_t firstRecvTimeUs) {
     /* PyroWave reorders and recovers its inner blocks itself.  The legacy
        contiguous-sequence window is not advanced on this direct path, so
        applying it here would reject a valid first RTP packet when its
        sequence number happens to be before the zero-initialized window. */
-    if (NegotiatedVideoFormat != VIDEO_FORMAT_PYROWAVE &&
+    if (!firstRecvTimeUs && NegotiatedVideoFormat != VIDEO_FORMAT_PYROWAVE &&
             isBefore16(packet->sequenceNumber, queue->nextContiguousSequenceNumber)) {
         // Reject packets behind our current buffer window
         return RTPF_RET_REJECTED;
@@ -780,7 +808,7 @@ int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_
         // being able to reconstruct a full frame from it.
         connectionSawFrame(queue->currentFrameNumber);
 
-        queue->bufferFirstRecvTimeUs = PltGetMicroseconds();
+        queue->bufferFirstRecvTimeUs = firstRecvTimeUs ? firstRecvTimeUs : PltGetMicroseconds();
         queue->bufferLowestSequenceNumber = U16(packet->sequenceNumber - fecIndex);
         queue->nextContiguousSequenceNumber = queue->bufferLowestSequenceNumber;
         queue->receivedDataPackets = 0;
@@ -890,5 +918,108 @@ int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_
 
         return RTPF_RET_QUEUED;
     }
+}
+
+// Feed the existing recovery and depacketization path in canonical RTP order.
+// On frame change, pass on partial groups too, so normal loss reporting, RFI
+// and reference-frame recovery retain their existing behavior.
+static void drainInterleavedBlocks(PRTP_VIDEO_QUEUE queue, bool endOfFrame) {
+    INTERLEAVED_FRAME* frame = queue->interleaved;
+    while (frame->nextBlock < frame->count) {
+        unsigned g = frame->nextBlock;
+        INTERLEAVED_BLOCK* block = &frame->blocks[g];
+        unsigned needed = block->data;
+#ifdef FEC_VALIDATION_MODE
+        needed += 1;
+#endif
+        if (!endOfFrame && (!block->data || block->received < needed ||
+                (block->receivedData < block->data && !(frame->finishedData & (1U << g))))) {
+            return;
+        }
+        for (unsigned i = 0; i < block->data + block->parity; i++) {
+            PRTPV_QUEUE_ENTRY entry = block->shards[i];
+            if (entry == NULL) continue;
+            block->shards[i] = NULL;
+            PRTP_PACKET packet = entry->packet;
+            if (addSequentialPacket(queue, packet, entry->length, entry, frame->firstRecvTimeUs) != RTPF_RET_QUEUED) {
+                free(packet);
+            }
+        }
+        frame->nextBlock++;
+    }
+    frame->count = 0;
+}
+
+int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_QUEUE_ENTRY entry) {
+    if (!VideoFecInterleavingEnabled) return addSequentialPacket(queue, packet, length, entry, 0);
+
+    const int offset = (int)sizeof(*packet) + ((packet->header & FLAG_EXTENSION) ? 4 : 0);
+    if (length < offset + (int)sizeof(NV_VIDEO_PACKET)) return RTPF_RET_REJECTED;
+    PNV_VIDEO_PACKET nv = (PNV_VIDEO_PACKET)((char*)packet + offset);
+    const uint32_t number = LE32(nv->frameIndex);
+    const uint32_t fec = LE32(nv->fecInfo);
+    INTERLEAVED_FRAME* frame = queue->interleaved;
+    if (isBefore32(number, RtpvGetCurrentFrameNumber(queue))) return RTPF_RET_REJECTED;
+    if (!(fec & SS_FEC_INFO_INTERLEAVED)) {
+        if (frame != NULL && frame->count) {
+            if (number == frame->number) return RTPF_RET_REJECTED;
+            drainInterleavedBlocks(queue, true);
+        }
+        return addSequentialPacket(queue, packet, length, entry, 0);
+    }
+
+    const unsigned group = (nv->multiFecBlocks >> 4) & 3;
+    const unsigned count = (nv->multiFecBlocks >> 6) + 1;
+    const unsigned data = fec >> 22;
+    const unsigned parity = (data * ((fec >> 4) & 0xff) + 99) / 100;
+    const unsigned index = (fec >> 12) & 0x3ff;
+    const uint16_t base = U16(packet->sequenceNumber - index);
+    if (group >= count || count < 2 || !data || !parity || data + parity > 255 || index >= data + parity) {
+        return RTPF_RET_REJECTED;
+    }
+    if (frame != NULL && frame->count && number != frame->number) drainInterleavedBlocks(queue, true);
+    if (frame == NULL) {
+        frame = calloc(1, sizeof(*frame));
+        if (frame == NULL) return RTPF_RET_REJECTED;
+        queue->interleaved = frame;
+    }
+    if (!frame->count) {
+        // Draining cleared all owned packet slots. Reset only the group counters.
+        for (unsigned g = 0; g < count; g++) {
+            frame->blocks[g].data = frame->blocks[g].parity = 0;
+            frame->blocks[g].receivedData = frame->blocks[g].received = 0;
+        }
+        frame->number = number;
+        frame->timestamp = packet->timestamp;
+        frame->count = (uint8_t)count;
+        frame->nextBlock = frame->finishedData = 0;
+        frame->firstRecvTimeUs = PltGetMicroseconds();
+    }
+    if (count != frame->count || packet->timestamp != frame->timestamp) return RTPF_RET_REJECTED;
+    if (group < frame->nextBlock) {
+        // A completed group's tail parity can still release a different group.
+        frame->finishedData |= nv->multiFecBlocks & 0x0f;
+        drainInterleavedBlocks(queue, false);
+        return RTPF_RET_REJECTED;
+    }
+    INTERLEAVED_BLOCK* block = &frame->blocks[group];
+    if (!block->data) {
+        block->data = (uint8_t)data;
+        block->parity = (uint8_t)parity;
+        block->baseSequence = base;
+    }
+    if (data != block->data || parity != block->parity || base != block->baseSequence || block->shards[index] != NULL) {
+        return RTPF_RET_REJECTED;
+    }
+    frame->finishedData |= nv->multiFecBlocks & 0x0f;
+    nv->multiFecBlocks &= 0xf0;
+    nv->fecInfo = LE32(fec & ~SS_FEC_INFO_INTERLEAVED);
+    entry->packet = packet;
+    entry->length = length;
+    block->shards[index] = entry;
+    block->received++;
+    block->receivedData += index < data;
+    drainInterleavedBlocks(queue, false);
+    return RTPF_RET_QUEUED;
 }
 

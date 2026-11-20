@@ -313,6 +313,7 @@ int LiStartConnection(PSERVER_INFORMATION serverInfo, PSTREAM_CONFIGURATION stre
     memset(&LocalAddr, 0, sizeof(LocalAddr));
     NegotiatedVideoFormat = 0;
     VideoFecControlSupported = false;
+    VideoFecInterleavingEnabled = false;
     memcpy(&StreamConfig, streamConfig, sizeof(StreamConfig));
     RemoteAddrString = strdup(serverInfo->address);
     if (StreamConfig.videoFecPercentage < -2 || StreamConfig.videoFecPercentage > 100) {
