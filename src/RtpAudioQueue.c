@@ -523,6 +523,13 @@ static void handleMissingPackets(PRTP_AUDIO_QUEUE queue) {
         return;
     }
 
+    const bool isMat = AUDIO_CODEC_IS_MAT(NegotiatedAudioCodec);
+    const uint64_t blockDurationMs = (uint64_t)AudioPacketDuration * RTPA_DATA_SHARDS;
+    // MAT waits one FEC block plus the reordering grace, both in milliseconds.
+    // Keep the existing shorter wait for codecs that can conceal a gap.
+    const uint64_t reorderWaitUs = isMat ? (blockDurationMs + RTPQ_OOS_WAIT_TIME_MS) * 1000 :
+                                          blockDurationMs + RTPQ_OOS_WAIT_TIME_MS * 1000;
+
     // If the packet we're waiting on precedes our earliest FEC block, a whole earlier block is missing.
     // Concealment codecs can resynchronize immediately; MAT must first allow for reordering below.
     //
@@ -533,9 +540,9 @@ static void handleMissingPackets(PRTP_AUDIO_QUEUE queue) {
     if (isBefore16(queue->nextRtpSequenceNumber, queue->blockHead->fecHeader.baseSequenceNumber)) {
         // A whole MAT block can be reordered too. Keep the same bounded wait as
         // a partial block before skipping data that the carrier cannot conceal.
-        if (AUDIO_CODEC_IS_MAT(NegotiatedAudioCodec)) {
+        if (isMat) {
             uint64_t waitUs = PltGetMicroseconds() - queue->blockHead->queueTimeUs;
-            if (waitUs <= (uint64_t)(AudioPacketDuration * RTPA_DATA_SHARDS) + (RTPQ_OOS_WAIT_TIME_MS * 1000)) {
+            if (waitUs <= reorderWaitUs) {
                 return;
             }
             Limelog("Live MAT whole-block gap expired (expected %u, next block %u, waited %llu us)\n",
@@ -560,7 +567,8 @@ static void handleMissingPackets(PRTP_AUDIO_QUEUE queue) {
     // If we have seen OOS data, we'll wait for a little while longer to see if OOS packets arrive before giving up.
     // MAT cannot conceal a skipped packet. Give even the first gap the bounded
     // recovery window so a late data/parity packet can preserve the carrier.
-    if ((!AUDIO_CODEC_IS_MAT(NegotiatedAudioCodec) && !queue->receivedOosData) || PltGetMicroseconds() - queue->blockHead->queueTimeUs > (uint64_t)(AudioPacketDuration * RTPA_DATA_SHARDS) + (RTPQ_OOS_WAIT_TIME_MS * 1000)) {
+    if ((!isMat && !queue->receivedOosData) ||
+        PltGetMicroseconds() - queue->blockHead->queueTimeUs > reorderWaitUs) {
         LC_ASSERT(!isBefore16(queue->nextRtpSequenceNumber, queue->blockHead->fecHeader.baseSequenceNumber));
 
         queue->stats.packetCountFecFailed++;

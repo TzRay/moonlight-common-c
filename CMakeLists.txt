@@ -272,7 +272,8 @@ if (BUILD_TESTING)
     target_include_directories(mat-live-rtp-tests PRIVATE enet/include
       $<TARGET_PROPERTY:moonlight-common-c,INCLUDE_DIRECTORIES>)
     target_compile_definitions(mat-live-rtp-tests PRIVATE
-      LC_DEBUG $<TARGET_PROPERTY:moonlight-common-c,COMPILE_DEFINITIONS>)
+      LC_DEBUG PltGetMicroseconds=MatRtpTestMicroseconds
+      $<TARGET_PROPERTY:moonlight-common-c,COMPILE_DEFINITIONS>)
     target_link_libraries(mat-live-rtp-tests PRIVATE moonlight-common-c)
     if(MSVC)
       target_compile_options(mat-live-rtp-tests PRIVATE /experimental:c11atomics)

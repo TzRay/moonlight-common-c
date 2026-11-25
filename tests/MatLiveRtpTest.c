@@ -151,6 +151,54 @@ static void fecRoundTrip(unsigned omitted, bool reordered, bool lateFinalBlock) 
     CHECK(cycles == 1 && ends == 1 && terminated == 0);
     closeSession();
 }
+#ifndef LC_AUDIO_FEC_VALIDATION
+static uint64_t queueClockUs = 1000000;
+
+uint64_t MatRtpTestMicroseconds(void) {
+    return queueClockUs;
+}
+
+static void delayedMatBlock(bool wholeBlock, unsigned delayUs, bool expectRecovery) {
+    uint8_t carrier[MAT_WIRE_CYCLE];
+    TEST_BLOCK last, eos;
+    beginSession();
+    makeCarrier(carrier, 0);
+    for (unsigned fragment = 0; fragment < MAT_WIRE_FRAGMENTS; fragment += RTPA_DATA_SHARDS) {
+        dataBlock(&last, carrier, 0, fragment);
+        if (fragment + RTPA_DATA_SHARDS < MAT_WIRE_FRAGMENTS) {
+            emitBlock(&last, 0, false);
+        }
+    }
+    if (!wholeBlock) {
+        for (unsigned i = 0; i < RTPA_DATA_SHARDS - 1; ++i) {
+            packet(last.base + i, last.shards[i], MAT_LIVE_PACKET);
+        }
+    }
+    endBlock(&eos, 1, mat_hash_update(2166136261u, carrier, sizeof(carrier)));
+    packet(eos.base, eos.shards[0], MAT_LIVE_PACKET);
+
+    // Trigger the queue's expiry check before delivering the missing block or parity.
+    queueClockUs += delayUs;
+    packet(eos.base + 1, eos.shards[1], MAT_LIVE_PACKET);
+    if (wholeBlock) {
+        emitBlock(&last, 0, false);
+    }
+    else {
+        parity(&last, RTPA_DATA_SHARDS);
+    }
+    for (unsigned i = 2; i < RTPA_DATA_SHARDS; ++i) {
+        packet(eos.base + i, eos.shards[i], MAT_LIVE_PACKET);
+    }
+    if (expectRecovery) {
+        CHECK(cycles == 1 && ends == 1 && terminated == 0);
+    }
+    else {
+        CHECK(cycles == 0 && ends == 0 && terminated == 1);
+    }
+    closeSession();
+}
+#endif
+
 static void permanentLoss(bool wholeBlock) {
     uint8_t carrier[MAT_WIRE_CYCLE]; TEST_BLOCK first, next;
     beginSession(); makeCarrier(carrier, 0);
@@ -248,6 +296,11 @@ int main(void) {
 #ifndef LC_AUDIO_FEC_VALIDATION
     fecRoundTrip(3, false, false); fecRoundTrip(3, true, false);
     fecRoundTrip(1u | (1u << 4), true, false); fecRoundTrip(3, true, true);
+    for (int whole = 0; whole <= 1; ++whole) {
+        delayedMatBlock(whole, 12000, true);
+        delayedMatBlock(whole, 14000, true);
+        delayedMatBlock(whole, 14001, false);
+    }
     permanentLoss(false); permanentLoss(true); queueOverflow(); opusRecovery(); longReorderedStream();
 #endif
     reed_solomon_release(senderRs); cleanupPlatform();
