@@ -277,6 +277,7 @@ static void failedV2CannotRevive(void) {
     // Media received/authenticated is not proof of playback progress.
     CHECK(!atomic_load(&playingCount));
     PltLockMutex(&matRecoveryMutex);matV2Deadline=PltGetMillis();PltUnlockMutex(&matRecoveryMutex);
+    atomic_store(&progressEpoch,656);atomic_store(&progressValue,3);
     CHECK(awaitCount(&failCount,3));queueMatAudioRecoveryControl(&noProgress);
     atomic_store(&progressEpoch,656);atomic_store(&progressValue,3);PltSleepMs(35);
     CHECK(!atomic_load(&playingCount)&&!atomic_load(&stableCount));
@@ -289,6 +290,22 @@ static void failedV2CannotRevive(void) {
     CHECK(!atomic_load(&terminated));
     uint64_t began=PltGetMillis();teardown();CHECK(PltGetMillis()-began<2000);
     int inits=atomic_load(&initialized);queueMatAudioRecoveryControl(&conflict);PltSleepMs(20);CHECK(atomic_load(&initialized)==inits);
+}
+static void peerFailureHasNoEcho(bool cleanupBlocked) {
+    setup(false);
+    MAT_AUDIO_RECOVERY peer = v2Prepare(1,456);
+    CHECK(awaitCount(&readyCount,1));
+    blockDuringCleanup = cleanupBlocked;
+    peer.verb = MAT_RECOVERY_FAIL;
+    peer.reason = MAT_RECOVERY_RETRYABLE;
+    queueMatAudioRecoveryControl(&peer);
+    CHECK(awaitCount(&cleaned,2));
+    if (cleanupBlocked) CHECK(awaitCount(&failCount,1));
+    queueMatAudioRecoveryControl(&peer);
+    PltSleepMs(120);
+    CHECK(atomic_load(&failCount) == (int)cleanupBlocked);
+    CHECK(atomic_load(&cleaned) == 2 && !atomic_load(&terminated));
+    teardown();
 }
 static void blockedV2PreservesConnection(void) {
     setup(false);blockDuringCleanup=true;v2Prepare(1,456);CHECK(awaitCount(&failCount,1));
@@ -339,6 +356,8 @@ int main(void) {
     setup(true);CHECK(requestMatAudioRecovery(1));CHECK(awaitCount(&terminated,1));teardown();
     repeatedV2WithOldPort();
     failedV2CannotRevive();
+    peerFailureHasNoEcho(false);
+    peerFailureHasNoEcho(true);
     blockedV2PreservesConnection();
     lostRendererRecoversOnReplacement();
     PltDeleteMutex(&testMutex);cleanupPlatform();

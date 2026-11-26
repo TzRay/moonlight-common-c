@@ -47,6 +47,7 @@ static MAT_V2_PHASE matV2Phase;
 static MAT_AUDIO_RECOVERY matV2Profile;
 static uint32_t matV2InstalledGeneration;
 static uint64_t matV2Deadline;
+static unsigned matV2PeerFailure, matV2SentFailure;
 static bool matV2Report, matV2ResendReady, matV2Start, matV2PlayingSent, matV2StableSent;
 static atomic_bool matRecoveryBlocked;
 static atomic_ullong matRejectedRtp;
@@ -173,7 +174,6 @@ static void startMatAudioWorker(int role) {
         matCallbacks.threadStart(matCallbacks.context, role);
     }
 }
-void LiSetMatPlaybackCallbacks(const LI_MAT_PLAYBACK_CALLBACKS* callbacks) {
 void LiSetMatPlaybackCallbacksEx(const LI_MAT_PLAYBACK_CALLBACKS* callbacks, size_t size) {
     LI_MAT_PLAYBACK_CALLBACKS next = {0};
     const size_t prefix = offsetof(LI_MAT_PLAYBACK_CALLBACKS, threadStart);
@@ -188,6 +188,7 @@ void LiSetMatPlaybackCallbacksEx(const LI_MAT_PLAYBACK_CALLBACKS* callbacks, siz
     registeredMatCallbacks = next;
     atomic_flag_clear_explicit(&matCallbackLock, memory_order_release);
 }
+void LiSetMatPlaybackCallbacks(const LI_MAT_PLAYBACK_CALLBACKS* callbacks) {
     LiSetMatPlaybackCallbacksEx(callbacks, offsetof(LI_MAT_PLAYBACK_CALLBACKS, threadStart));
 }
 static int matEnd(void* context,uint64_t cycles) {
@@ -364,6 +365,7 @@ int initializeAudioStream(void) {
     atomic_store(&initialAudioStartComplete, false);
     audioPrepared = receiveStarted = decoderStarted = false;
     matV2Phase = MAT_V2_RUNNING;
+    matV2PeerFailure = matV2SentFailure = 0;
     memset(&matV2Profile, 0, sizeof(matV2Profile));
     matV2InstalledGeneration = 0;
     matV2Report = matV2ResendReady = matV2Start = matV2PlayingSent = matV2StableSent = false;
@@ -928,8 +930,6 @@ static int prepareAudioGeneration(void* audioContext, int arFlags) {
     }
     audioPrepared = true;
 
-    LI_MAT_PLAYBACK_CALLBACKS callbacks=matCallbacks;callbacks.end=matCallbacks.end?matEnd:NULL;
-    if (callbacks.cycle) callbacks.cycle = timedMatCycle;
     if (AUDIO_CODEC_IS_MAT(NegotiatedAudioCodec)) {
         snapshotMatCallbacks();
         if (NegotiatedMatAudioRecovery == 2 && !matCallbacks.progress) {
@@ -940,6 +940,8 @@ static int prepareAudioGeneration(void* audioContext, int arFlags) {
             return -1;
         }
     }
+    LI_MAT_PLAYBACK_CALLBACKS callbacks=matCallbacks;callbacks.end=matCallbacks.end?matEnd:NULL;
+    if (callbacks.cycle) callbacks.cycle = timedMatCycle;
     if(AUDIO_CODEC_IS_MAT(NegotiatedAudioCodec)) {
         atomic_store_explicit(&matInputEnded,false,memory_order_relaxed);
         atomic_store_explicit(&matLastAcceptedMs,PltGetMillis(),memory_order_relaxed);
@@ -1074,6 +1076,7 @@ static void queueMatRecoveryV2(const MAT_AUDIO_RECOVERY* m) {
     PltLockMutex(&matRecoveryMutex);
     if (m->verb == MAT_RECOVERY_PREPARE && m->generation > matV2Profile.generation) {
         matV2Profile = *m;
+        matV2PeerFailure = matV2SentFailure = 0;
         matV2Phase = atomic_load(&matRecoveryBlocked) ? MAT_V2_FAILED : MAT_V2_PENDING;
         matV2Report = atomic_load(&matRecoveryBlocked);
         matV2Start = matV2ResendReady = matV2PlayingSent = matV2StableSent = false;
@@ -1083,6 +1086,9 @@ static void queueMatRecoveryV2(const MAT_AUDIO_RECOVERY* m) {
         if (m->verb == MAT_RECOVERY_FAIL &&
             (!m->clientPort || !matV2Profile.clientPort || m->clientPort == matV2Profile.clientPort)) {
             if (m->reason == MAT_RECOVERY_BLOCKED) atomic_store(&matRecoveryBlocked, true);
+            matV2PeerFailure = (m->reason == MAT_RECOVERY_BLOCKED || matV2PeerFailure == MAT_RECOVERY_BLOCKED)
+                ? MAT_RECOVERY_BLOCKED : MAT_RECOVERY_RETRYABLE;
+            matV2Report = false;
             matV2Phase = MAT_V2_FAILED;
             // Do not echo FAIL indefinitely. A cleanup failure can still
             // upgrade this result to BLOCKED in the worker.
@@ -1112,7 +1118,7 @@ static void matV2Fail(uint32_t generation) {
     PltLockMutex(&matRecoveryMutex);
     if (generation == matV2Profile.generation) {
         matV2Phase = MAT_V2_FAILED;
-        matV2Report = true;
+        matV2Report = !matV2PeerFailure || (atomic_load(&matRecoveryBlocked) && matV2PeerFailure != MAT_RECOVERY_BLOCKED);
     }
     PltUnlockMutex(&matRecoveryMutex);
 }
@@ -1144,6 +1150,13 @@ static void MatRecoveryV2ThreadProc(void) {
                 stopped = true;
                 if (!wasBlocked && atomic_load(&matRecoveryBlocked)) report = true;
             }
+            PltLockMutex(&matRecoveryMutex);
+            unsigned reason = atomic_load(&matRecoveryBlocked) ? MAT_RECOVERY_BLOCKED : MAT_RECOVERY_RETRYABLE;
+            report = matV2Profile.generation == message.generation && matV2SentFailure != reason &&
+                     ((report && !matV2PeerFailure) ||
+                      (reason == MAT_RECOVERY_BLOCKED && matV2PeerFailure == MAT_RECOVERY_RETRYABLE));
+            if (report) matV2SentFailure = reason;
+            PltUnlockMutex(&matRecoveryMutex);
             if (report) {
                 message.reason = atomic_load(&matRecoveryBlocked) ? MAT_RECOVERY_BLOCKED : MAT_RECOVERY_RETRYABLE;
                 if (!message.generation) {
@@ -1191,6 +1204,11 @@ static void MatRecoveryV2ThreadProc(void) {
             }
             PltLockMutex(&matRecoveryMutex);
             bool current = matV2Profile.generation == message.generation && matV2Phase == MAT_V2_PENDING;
+            if (current && PltGetMillis() >= deadline) {
+                matV2Phase = MAT_V2_FAILED;
+                matV2Report = true;
+                current = false;
+            }
             if (current) {
                 matV2Profile.clientPort = message.clientPort;
                 matV2Phase = MAT_V2_READY;
@@ -1221,11 +1239,11 @@ static void MatRecoveryV2ThreadProc(void) {
             PltLockMutex(&matRecoveryMutex);
             bool current = matV2Profile.generation == message.generation &&
                 (matV2Phase == MAT_V2_CONFIRMING || matV2Phase == MAT_V2_PLAYING);
-            bool playing = current && (progress & 1) && !matV2PlayingSent;
-            bool stable = current && (progress & 3) == 3 && !matV2StableSent;
+            bool timedOut = current && matV2Phase == MAT_V2_CONFIRMING && PltGetMillis() >= matV2Deadline;
+            bool playing = current && !timedOut && (progress & 1) && !matV2PlayingSent;
+            bool stable = current && !timedOut && (progress & 3) == 3 && !matV2StableSent;
             if (playing) { matV2PlayingSent = true; matV2Phase = MAT_V2_PLAYING; }
             if (stable) matV2StableSent = true;
-            bool timedOut = current && matV2Phase == MAT_V2_CONFIRMING && PltGetMillis() >= deadline;
             PltUnlockMutex(&matRecoveryMutex);
             if (playing && !matV2Send(&message, MAT_RECOVERY_PLAYING)) return;
             if (stable && !matV2Send(&message, MAT_RECOVERY_STABLE)) return;
@@ -1244,10 +1262,18 @@ static void MatRecoveryThreadProc(void* context) {
     if (recoveryCancelled()) return;
     if (NegotiatedMatAudioRecovery == 2) { MatRecoveryV2ThreadProc(); return; }
     for (;;) {
-        PltWaitForEvent(&matRecoveryEvent);
-        PltClearEvent(&matRecoveryEvent);
-        if (recoveryCancelled()) return;
         PltLockMutex(&matRecoveryMutex);
+        if (!matRecoveryBusy && !matRecoveryFailed && !matRecoveryResendReady) {
+            PltClearEvent(&matRecoveryEvent);
+            PltUnlockMutex(&matRecoveryMutex);
+            if (recoveryCancelled()) return;
+            PltWaitForEvent(&matRecoveryEvent);
+            continue;
+        }
+        if (recoveryCancelled()) {
+            PltUnlockMutex(&matRecoveryMutex);
+            return;
+        }
         bool busy = matRecoveryBusy, failed = matRecoveryFailed;
         bool sendRequest = busy && !matRecoveryHavePrepare;
         bool resendReady = matRecoveryResendReady;
