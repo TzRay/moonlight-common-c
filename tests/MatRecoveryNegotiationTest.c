@@ -71,6 +71,10 @@ static void serve(void* context) {
             CHECK(!NegotiatedMatAudioRecovery);
             char selection[64];snprintf(selection,sizeof(selection),"a=x-ml-audio.mat-live-recovery:%u",peer->expectedEcho);
             CHECK((strstr(request, "a=x-ml-audio.mat-live-recovery:") != NULL) == (peer->expectedEcho != 0));
+            bool background = peer->expectedEcho == 2 &&
+                (AudioCallbacks.capabilities & CAPABILITY_MAT_BACKGROUND_PAUSE) &&
+                strstr(peer->offer, "a=x-ss-audio.mat-background-pause:1\r\n");
+            CHECK((strstr(request, "a=x-ml-audio.mat-background-pause:1") != NULL) == background);
             if(peer->expectedEcho)CHECK(strstr(request,selection)!=NULL);
             const char* feature = strstr(request, "a=x-ml-general.featureFlags:");
             CHECK(feature != NULL);
@@ -94,6 +98,8 @@ static void serve(void* context) {
     }
 }
 
+static uint16_t externalPort;
+
 static void run(const char* name, const char* offer, const char* confirmation,
                 bool encryptedControl, bool pingIdentity, bool mat,
                 unsigned expectedEcho, int expectedResult, unsigned expectedRecovery) {
@@ -105,16 +111,20 @@ static void run(const char* name, const char* offer, const char* confirmation,
     bool unavailable = strstr(offer, "a=x-ss-audio.mat-unavailable:") != NULL;
     peer.mat = mat && !unavailable;
     peer.expectedEcho = expectedEcho;
-    peer.listener = createSocket(AF_INET, SOCK_STREAM, IPPROTO_TCP, false);
-    CHECK(peer.listener != INVALID_SOCKET);
     struct sockaddr_in address = {0};
     address.sin_family = AF_INET;
     address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    CHECK(bind(peer.listener, (struct sockaddr*)&address, sizeof(address)) == 0);
-    CHECK(listen(peer.listener, 4) == 0);
-    SOCKADDR_LEN size = sizeof(address);
-    CHECK(getsockname(peer.listener, (struct sockaddr*)&address, &size) == 0);
-    RtspPortNumber = ntohs(address.sin_port);
+    if (externalPort) {
+        RtspPortNumber = externalPort;
+    } else {
+        peer.listener = createSocket(AF_INET, SOCK_STREAM, IPPROTO_TCP, false);
+        CHECK(peer.listener != INVALID_SOCKET);
+        CHECK(bind(peer.listener, (struct sockaddr*)&address, sizeof(address)) == 0);
+        CHECK(listen(peer.listener, 4) == 0);
+        SOCKADDR_LEN size = sizeof(address);
+        CHECK(getsockname(peer.listener, (struct sockaddr*)&address, &size) == 0);
+        RtspPortNumber = ntohs(address.sin_port);
+    }
     AudioPortNumber = VideoPortNumber = ControlPortNumber = 0;
     memset(&RemoteAddr, 0, sizeof(RemoteAddr));
     memcpy(&RemoteAddr, &address, sizeof(address));
@@ -126,22 +136,24 @@ static void run(const char* name, const char* offer, const char* confirmation,
     ConnectionInterrupted = false;
     CHECK(initializeAudioStream() == 0);
     PLT_THREAD thread;
-    CHECK(PltCreateThread("RTSP recovery test", serve, &peer, &thread) == 0);
+    if (!externalPort) CHECK(PltCreateThread("RTSP recovery test", serve, &peer, &thread) == 0);
     SERVER_INFORMATION server = {0};
     int result = performRtspHandshake(&server);
     peer.stop = true;
-    PltJoinThread(&thread);
-    closeSocket(peer.listener);
+    if (!externalPort) {
+        PltJoinThread(&thread);
+        closeSocket(peer.listener);
+    }
     destroyAudioStream();
     CHECK(result == expectedResult);
     CHECK(NegotiatedMatAudioRecovery == expectedRecovery);
-    CHECK(peer.announces == (unavailable && mat ? 0 : 1));
+    if (!externalPort) CHECK(peer.announces == (unavailable && mat ? 0 : 1));
     if (unavailable && !mat) CHECK(NegotiatedAudioCodec == AUDIO_CODEC_OPUS);
     if(expectedRecovery==2)CHECK(NegotiatedMatAudioSsrc==123456);
     printf("PASS %s: result=%d recovery=%d\n", name, result, NegotiatedMatAudioRecovery);
 }
 
-int main(void) {
+int main(int argc, char** argv) {
     const char* offer = "a=x-ss-audio.mat-live-recovery:1\r\n";
     const char* confirmation = "X-SS-Mat-Live-Recovery: 1\r\n";
     CHECK(initializePlatform() == 0);
@@ -154,6 +166,18 @@ int main(void) {
     StreamConfig.supportedVideoFormats = VIDEO_FORMAT_H264;
     StreamConfig.audioConfiguration = AUDIO_CONFIGURATION_STEREO;
     StreamConfig.streamingRemotely = STREAM_CFG_LOCAL;
+    // The Sunshine mat_announce_tests --loopback fixture uses the actual host
+    // parser and response implementation. Production services are unnecessary.
+    if (argc == 3 && !strcmp(argv[1], "--loopback-host")) {
+        int port = atoi(argv[2]);
+        CHECK(port > 0 && port <= 65535);
+        externalPort = (uint16_t)port;
+        AudioCallbacks.capabilities |= CAPABILITY_MAT_PLAYBACK_PROGRESS | CAPABILITY_MAT_BACKGROUND_PAUSE;
+        run("Sunshine background agreement", "", "", true, true, true, 2, 0, 2);
+        CHECK(NegotiatedMatBackground);
+        cleanupPlatform();
+        return 0;
+    }
     run("three-phase agreement", offer, confirmation, true, true, true, true, 0, true);
     run("missing encoder, strict", "a=x-ss-audio.mat-unavailable:1\r\n", "", true, true, true, 0, ML_ERROR_MAT_ENCODER_MISSING, 0);
     run("incompatible encoder, strict", "a=x-ss-audio.mat-unavailable:2\r\n", "", true, true, true, 0, ML_ERROR_MAT_ENCODER_INCOMPATIBLE, 0);

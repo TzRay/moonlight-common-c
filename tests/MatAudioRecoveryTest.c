@@ -459,9 +459,13 @@ static void negotiatedBackground(void) {
     eventRenderer = false;
     setup(false);
     CHECK(!LiGetMatBackgroundSession());
+    const int legacyControls = atomic_load(&bgSentCount);
+    LiSetMatBackgroundPaused(123, true);
+    LiSetMatBackgroundPaused(123, false);
     LiSetMatBackgroundPaused(123, true);
     sendCycle(oldPort, 123);
     CHECK(awaitCount(&delivered, 1) && !atomic_load(&cleaned));
+    CHECK(atomic_load(&bgSentCount) == legacyControls && !atomic_load(&terminated));
     teardown();
 }
 
