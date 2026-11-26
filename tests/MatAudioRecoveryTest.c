@@ -192,6 +192,12 @@ static void setup(bool failRenderer) {
     NormalQualityOpusConfig.sampleRate=48000;NormalQualityOpusConfig.channelCount=2;NormalQualityOpusConfig.streams=1;
     HighQualitySurroundEnabled=false;memset(&AudioPingPayload,0,sizeof(AudioPingPayload));AudioPingPayload.payload[15]=1;
     CHECK(initializeAudioStream()==0);
+    // setup() is reused after failed, paused and completed sessions.
+    CHECK(matV2.phase == MAT_V2_RUNNING && !matV2.installedGeneration && !matV2.deadline);
+    CHECK(!matV2.profile.generation && !matV2.peerFailure && !matV2.sentFailure);
+    CHECK(!matBackground.request.serial && !matBackground.pendingPrepare.generation);
+    CHECK(!matBackground.retryAt && !matBackground.generationFence &&
+          !matBackground.awaitingReply && !matBackground.suspended && !matBackground.waitingPrepare);
     CHECK(!matReceiveDiagnostics.gapSamples && !matDecodeDiagnostics.gapSamples);
     CHECK(notifyAudioPortNegotiationComplete()==0);
     oldPort=audioSocketPort(rtpSocket);CHECK(startAudioStream((void*)0x1234,17)==0);
@@ -250,7 +256,7 @@ static MAT_AUDIO_RECOVERY v2Start(int ready) {
     start.verb=MAT_RECOVERY_START;queueMatAudioRecoveryControl(&start);
     uint64_t deadline=PltGetMillis()+2000;
     for(;;) {
-        PltLockMutex(&matRecoveryMutex);bool running=matV2Phase==MAT_V2_CONFIRMING;PltUnlockMutex(&matRecoveryMutex);
+        PltLockMutex(&matRecoveryMutex);bool running=matV2.phase==MAT_V2_CONFIRMING;PltUnlockMutex(&matRecoveryMutex);
         if(running||PltGetMillis()>=deadline)break;
         PltSleepMs(1);
     }
@@ -309,14 +315,14 @@ static void failedV2CannotRevive(void) {
     v2Prepare(2,556);CHECK(awaitCount(&readyCount,1));
     PltLockMutex(&testMutex);failed=prepared;PltUnlockMutex(&testMutex);
     // Expire the real worker deadline; a late START must not create workers.
-    PltLockMutex(&matRecoveryMutex);matV2Deadline=PltGetMillis();PltUnlockMutex(&matRecoveryMutex);
+    PltLockMutex(&matRecoveryMutex);matV2.deadline=PltGetMillis();PltUnlockMutex(&matRecoveryMutex);
     CHECK(awaitCount(&failCount,2));failed.verb=MAT_RECOVERY_START;queueMatAudioRecoveryControl(&failed);
     PltSleepMs(35);CHECK(!receiveStarted&&!decoderStarted);
     v2Prepare(3,656);MAT_AUDIO_RECOVERY noProgress=v2Start(2);
     sendCycle(noProgress.clientPort,656);CHECK(awaitCount(&delivered,1));
     // Media received/authenticated is not proof of playback progress.
     CHECK(!atomic_load(&playingCount));
-    PltLockMutex(&matRecoveryMutex);matV2Deadline=PltGetMillis();PltUnlockMutex(&matRecoveryMutex);
+    PltLockMutex(&matRecoveryMutex);matV2.deadline=PltGetMillis();PltUnlockMutex(&matRecoveryMutex);
     atomic_store(&progressEpoch,656);atomic_store(&progressValue,3);
     CHECK(awaitCount(&failCount,3));queueMatAudioRecoveryControl(&noProgress);
     atomic_store(&progressEpoch,656);atomic_store(&progressValue,3);PltSleepMs(35);

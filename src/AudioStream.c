@@ -50,12 +50,14 @@ static void MatRecoveryThreadProc(void* context);
  * teardown/setup; the control receiver never creates or destroys resources. */
 typedef enum { MAT_V2_RUNNING, MAT_V2_REQUESTED, MAT_V2_PENDING, MAT_V2_READY,
                MAT_V2_CONFIRMING, MAT_V2_PLAYING, MAT_V2_FAILED, MAT_V2_BACKGROUND } MAT_V2_PHASE;
-static MAT_V2_PHASE matV2Phase;
-static MAT_AUDIO_RECOVERY matV2Profile;
-static uint32_t matV2InstalledGeneration;
-static uint64_t matV2Deadline;
-static unsigned matV2PeerFailure, matV2SentFailure;
-static bool matV2Report, matV2ResendReady, matV2Start, matV2PlayingSent, matV2StableSent;
+static struct {
+    MAT_V2_PHASE phase;
+    MAT_AUDIO_RECOVERY profile;
+    uint32_t installedGeneration;
+    uint64_t deadline;
+    unsigned peerFailure, sentFailure;
+    bool report, resendReady, start, playingSent, stableSent;
+} matV2;
 static atomic_bool matRecoveryBlocked;
 static atomic_ullong matRejectedRtp;
 static void MatRecoveryV2ThreadProc(void);
@@ -65,11 +67,14 @@ static void queueMatRecoveryV2(const MAT_AUDIO_RECOVERY* m);
 // The same callback lock pins the session identity, mutex and event for UI
 // callers. Unlike the playback notification identity it survives audio rebuilds.
 static uint64_t matBackgroundSession;
-static MAT_BACKGROUND matBgRequest;
-static MAT_AUDIO_RECOVERY matBgPrepare;
-static uint64_t matBgRetryAt;
-static uint32_t matBgFence;
-static bool matBgAwait, matBgSuspended, matBgWaitingPrepare;
+// The recovery mutex protects these fields throughout one connection.
+static struct {
+    MAT_BACKGROUND request;
+    MAT_AUDIO_RECOVERY pendingPrepare;
+    uint64_t retryAt;
+    uint32_t generationFence;
+    bool awaitingReply, suspended, waitingPrepare;
+} matBackground;
 
 static void setMatBackgroundSession(uint64_t epoch) {
     lockMatCallbacks();
@@ -88,18 +93,18 @@ void LiSetMatBackgroundPaused(uint64_t session, bool paused) {
     lockMatCallbacks();
     if (session && session == matBackgroundSession) {
         PltLockMutex(&matRecoveryMutex);
-        bool previous = matBgRequest.verb == MAT_BG_SUSPEND;
+        bool previous = matBackground.request.verb == MAT_BG_SUSPEND;
         if (previous != paused) {
-            matBgRequest.verb = paused ? MAT_BG_SUSPEND : MAT_BG_RESUME;
-            if (++matBgRequest.serial == 0) ++matBgRequest.serial;
-            matBgRequest.generation = matV2InstalledGeneration;
-            matBgRequest.sessionEpoch = session;
-            matBgAwait = true;
-            matBgWaitingPrepare = false;
-            matBgPrepare.generation = 0;
-            matBgRetryAt = 0;
-            matV2Phase = MAT_V2_BACKGROUND;
-            matV2Report = matV2ResendReady = false;
+            matBackground.request.verb = paused ? MAT_BG_SUSPEND : MAT_BG_RESUME;
+            if (++matBackground.request.serial == 0) ++matBackground.request.serial;
+            matBackground.request.generation = matV2.installedGeneration;
+            matBackground.request.sessionEpoch = session;
+            matBackground.awaitingReply = true;
+            matBackground.waitingPrepare = false;
+            matBackground.pendingPrepare.generation = 0;
+            matBackground.retryAt = 0;
+            matV2.phase = MAT_V2_BACKGROUND;
+            matV2.report = matV2.resendReady = false;
             PltSetEvent(&matRecoveryEvent);
         }
         PltUnlockMutex(&matRecoveryMutex);
@@ -115,18 +120,18 @@ void queueMatBackgroundControl(const MAT_BACKGROUND* m) {
         return;
     }
     PltLockMutex(&matRecoveryMutex);
-    if ((matBgAwait || (matBgWaitingPrepare && m->verb == MAT_BG_BLOCKED)) &&
-        m->serial == matBgRequest.serial && m->sessionEpoch == matBgRequest.sessionEpoch &&
-        m->generation >= matBgRequest.generation &&
-        ((m->verb == MAT_BG_SUSPENDED && matBgRequest.verb == MAT_BG_SUSPEND) ||
-         (m->verb == MAT_BG_RESUMING && matBgRequest.verb == MAT_BG_RESUME) || m->verb == MAT_BG_BLOCKED)) {
-        matBgAwait = false;
-        matBgFence = m->generation;
+    if ((matBackground.awaitingReply || (matBackground.waitingPrepare && m->verb == MAT_BG_BLOCKED)) &&
+        m->serial == matBackground.request.serial && m->sessionEpoch == matBackground.request.sessionEpoch &&
+        m->generation >= matBackground.request.generation &&
+        ((m->verb == MAT_BG_SUSPENDED && matBackground.request.verb == MAT_BG_SUSPEND) ||
+         (m->verb == MAT_BG_RESUMING && matBackground.request.verb == MAT_BG_RESUME) || m->verb == MAT_BG_BLOCKED)) {
+        matBackground.awaitingReply = false;
+        matBackground.generationFence = m->generation;
         if (m->verb == MAT_BG_BLOCKED) atomic_store(&matRecoveryBlocked, true);
-        matBgSuspended = m->verb != MAT_BG_RESUMING;
-        matBgWaitingPrepare = !matBgSuspended;
-        if (matBgWaitingPrepare && matBgPrepare.generation > matBgFence) pending = matBgPrepare;
-        matBgPrepare.generation = 0;
+        matBackground.suspended = m->verb != MAT_BG_RESUMING;
+        matBackground.waitingPrepare = !matBackground.suspended;
+        if (matBackground.waitingPrepare && matBackground.pendingPrepare.generation > matBackground.generationFence) pending = matBackground.pendingPrepare;
+        matBackground.pendingPrepare.generation = 0;
         PltSetEvent(&matRecoveryEvent);
     }
     PltUnlockMutex(&matRecoveryMutex);
@@ -137,14 +142,14 @@ void queueMatBackgroundControl(const MAT_BACKGROUND* m) {
 // matCallbackLock pins the current event/mutex until the notification returns.
 static void notifyMatFailureLocked(void) {
     PltLockMutex(&matRecoveryMutex);
-    if (matV2Phase == MAT_V2_RUNNING ||
-        (matV2Profile.newEpoch == notificationEpoch && matV2Phase != MAT_V2_FAILED && matV2Phase != MAT_V2_BACKGROUND)) {
-        matV2Phase = matV2Profile.generation ? MAT_V2_FAILED : MAT_V2_REQUESTED;
-        matV2Report = true;
+    if (matV2.phase == MAT_V2_RUNNING ||
+        (matV2.profile.newEpoch == notificationEpoch && matV2.phase != MAT_V2_FAILED && matV2.phase != MAT_V2_BACKGROUND)) {
+        matV2.phase = matV2.profile.generation ? MAT_V2_FAILED : MAT_V2_REQUESTED;
+        matV2.report = true;
     }
-    else if (matV2Phase == MAT_V2_FAILED && atomic_load(&matRecoveryBlocked) &&
-             matV2PeerFailure != MAT_RECOVERY_BLOCKED && matV2SentFailure != MAT_RECOVERY_BLOCKED) {
-        matV2Report = true;
+    else if (matV2.phase == MAT_V2_FAILED && atomic_load(&matRecoveryBlocked) &&
+             matV2.peerFailure != MAT_RECOVERY_BLOCKED && matV2.sentFailure != MAT_RECOVERY_BLOCKED) {
+        matV2.report = true;
     }
     PltSetEvent(&matRecoveryEvent);
     PltUnlockMutex(&matRecoveryMutex);
@@ -476,14 +481,9 @@ int initializeAudioStream(void) {
     atomic_store(&matRecoveryStopping, false);
     atomic_store(&initialAudioStartComplete, false);
     audioPrepared = receiveStarted = decoderStarted = false;
-    matV2Phase = MAT_V2_RUNNING;
-    memset(&matBgRequest, 0, sizeof(matBgRequest));
-    matBgAwait = matBgSuspended = matBgWaitingPrepare = false;
-    matBgFence = matBgPrepare.generation = 0;
-    matV2PeerFailure = matV2SentFailure = 0;
-    memset(&matV2Profile, 0, sizeof(matV2Profile));
-    matV2InstalledGeneration = 0;
-    matV2Report = matV2ResendReady = matV2Start = matV2PlayingSent = matV2StableSent = false;
+    memset(&matV2, 0, sizeof(matV2));
+    matV2.phase = MAT_V2_RUNNING;
+    memset(&matBackground, 0, sizeof(matBackground));
     atomic_store(&matRecoveryBlocked, false);
     memset(&matReceiveDiagnostics, 0, sizeof(matReceiveDiagnostics));
     memset(&matDecodeDiagnostics, 0, sizeof(matDecodeDiagnostics));
@@ -1202,9 +1202,9 @@ static uint16_t audioSocketPort(SOCKET socket) {
 static bool requestMatRecoveryV2(uint32_t reason) {
     PltLockMutex(&matRecoveryMutex);
     if (reason == MAT_RECOVERY_BLOCKED) atomic_store(&matRecoveryBlocked, true);
-    if (matV2Phase == MAT_V2_RUNNING || matV2Phase == MAT_V2_CONFIRMING || matV2Phase == MAT_V2_PLAYING) {
-        matV2Phase = matV2Profile.generation ? MAT_V2_FAILED : MAT_V2_REQUESTED;
-        matV2Report = true;
+    if (matV2.phase == MAT_V2_RUNNING || matV2.phase == MAT_V2_CONFIRMING || matV2.phase == MAT_V2_PLAYING) {
+        matV2.phase = matV2.profile.generation ? MAT_V2_FAILED : MAT_V2_REQUESTED;
+        matV2.report = true;
     }
     PltUnlockMutex(&matRecoveryMutex);
     PltSetEvent(&matRecoveryEvent);
@@ -1214,41 +1214,41 @@ static bool requestMatRecoveryV2(uint32_t reason) {
 static void queueMatRecoveryV2(const MAT_AUDIO_RECOVERY* m) {
     if (MatRecoveryVersion(m) != 2) return;
     PltLockMutex(&matRecoveryMutex);
-    if (matBgAwait || matBgSuspended || (matBgRequest.serial && m->generation <= matBgFence)) {
+    if (matBackground.awaitingReply || matBackground.suspended || (matBackground.request.serial && m->generation <= matBackground.generationFence)) {
         // RESUMING and PREPARE may be dequeued on neighboring control ticks.
         // Only its matching acknowledgment identifies the old-generation fence.
-        if (matBgAwait && matBgRequest.verb == MAT_BG_RESUME && m->verb == MAT_RECOVERY_PREPARE &&
-            m->generation > matBgPrepare.generation) matBgPrepare = *m;
+        if (matBackground.awaitingReply && matBackground.request.verb == MAT_BG_RESUME && m->verb == MAT_RECOVERY_PREPARE &&
+            m->generation > matBackground.pendingPrepare.generation) matBackground.pendingPrepare = *m;
         PltUnlockMutex(&matRecoveryMutex);
         return;
     }
-    if (m->verb == MAT_RECOVERY_PREPARE && m->generation > matV2Profile.generation) {
-        matBgWaitingPrepare = false;
-        matV2Profile = *m;
-        matV2PeerFailure = matV2SentFailure = 0;
-        matV2Phase = atomic_load(&matRecoveryBlocked) ? MAT_V2_FAILED : MAT_V2_PENDING;
-        matV2Report = atomic_load(&matRecoveryBlocked);
-        matV2Start = matV2ResendReady = matV2PlayingSent = matV2StableSent = false;
-        matV2Deadline = PltGetMillis() + MAT_RECOVERY_TIMEOUT_MS;
+    if (m->verb == MAT_RECOVERY_PREPARE && m->generation > matV2.profile.generation) {
+        matBackground.waitingPrepare = false;
+        matV2.profile = *m;
+        matV2.peerFailure = matV2.sentFailure = 0;
+        matV2.phase = atomic_load(&matRecoveryBlocked) ? MAT_V2_FAILED : MAT_V2_PENDING;
+        matV2.report = atomic_load(&matRecoveryBlocked);
+        matV2.start = matV2.resendReady = matV2.playingSent = matV2.stableSent = false;
+        matV2.deadline = PltGetMillis() + MAT_RECOVERY_TIMEOUT_MS;
     }
-    else if (MatRecoveryMatchesProfile(&matV2Profile, m)) {
+    else if (MatRecoveryMatchesProfile(&matV2.profile, m)) {
         if (m->verb == MAT_RECOVERY_FAIL &&
-            (!m->clientPort || !matV2Profile.clientPort || m->clientPort == matV2Profile.clientPort)) {
+            (!m->clientPort || !matV2.profile.clientPort || m->clientPort == matV2.profile.clientPort)) {
             if (m->reason == MAT_RECOVERY_BLOCKED) atomic_store(&matRecoveryBlocked, true);
-            matV2PeerFailure = (m->reason == MAT_RECOVERY_BLOCKED || matV2PeerFailure == MAT_RECOVERY_BLOCKED)
+            matV2.peerFailure = (m->reason == MAT_RECOVERY_BLOCKED || matV2.peerFailure == MAT_RECOVERY_BLOCKED)
                 ? MAT_RECOVERY_BLOCKED : MAT_RECOVERY_RETRYABLE;
-            matV2Report = false;
-            matV2Phase = MAT_V2_FAILED;
+            matV2.report = false;
+            matV2.phase = MAT_V2_FAILED;
             // Do not echo FAIL indefinitely. A cleanup failure can still
             // upgrade this result to BLOCKED in the worker.
         }
-        else if (matV2Phase != MAT_V2_FAILED && !atomic_load(&matRecoveryBlocked)) {
-            if (m->verb == MAT_RECOVERY_PREPARE && matV2Profile.clientPort &&
-                (matV2Phase == MAT_V2_READY || matV2Phase == MAT_V2_CONFIRMING || matV2Phase == MAT_V2_PLAYING))
-                matV2ResendReady = true;
-            else if (m->verb == MAT_RECOVERY_START && m->clientPort == matV2Profile.clientPort &&
-                     matV2Phase == MAT_V2_READY && PltGetMillis() < matV2Deadline)
-                matV2Start = true;
+        else if (matV2.phase != MAT_V2_FAILED && !atomic_load(&matRecoveryBlocked)) {
+            if (m->verb == MAT_RECOVERY_PREPARE && matV2.profile.clientPort &&
+                (matV2.phase == MAT_V2_READY || matV2.phase == MAT_V2_CONFIRMING || matV2.phase == MAT_V2_PLAYING))
+                matV2.resendReady = true;
+            else if (m->verb == MAT_RECOVERY_START && m->clientPort == matV2.profile.clientPort &&
+                     matV2.phase == MAT_V2_READY && PltGetMillis() < matV2.deadline)
+                matV2.start = true;
         }
     }
     // Old, conflicting and unsolicited messages cannot mutate the attempt.
@@ -1258,16 +1258,16 @@ static void queueMatRecoveryV2(const MAT_AUDIO_RECOVERY* m) {
 
 static bool matV2Current(uint32_t generation) {
     PltLockMutex(&matRecoveryMutex);
-    bool current = matV2Profile.generation == generation && matV2Phase != MAT_V2_FAILED && matV2Phase != MAT_V2_BACKGROUND;
+    bool current = matV2.profile.generation == generation && matV2.phase != MAT_V2_FAILED && matV2.phase != MAT_V2_BACKGROUND;
     PltUnlockMutex(&matRecoveryMutex);
     return current && !atomic_load(&matRecoveryBlocked) && !recoveryCancelled();
 }
 
 static void matV2Fail(uint32_t generation) {
     PltLockMutex(&matRecoveryMutex);
-    if (generation == matV2Profile.generation && matV2Phase != MAT_V2_BACKGROUND) {
-        matV2Phase = MAT_V2_FAILED;
-        matV2Report = !matV2PeerFailure || (atomic_load(&matRecoveryBlocked) && matV2PeerFailure != MAT_RECOVERY_BLOCKED);
+    if (generation == matV2.profile.generation && matV2.phase != MAT_V2_BACKGROUND) {
+        matV2.phase = MAT_V2_FAILED;
+        matV2.report = !matV2.peerFailure || (atomic_load(&matRecoveryBlocked) && matV2.peerFailure != MAT_RECOVERY_BLOCKED);
     }
     PltUnlockMutex(&matRecoveryMutex);
 }
@@ -1285,16 +1285,16 @@ static void MatRecoveryV2ThreadProc(void) {
     bool stopped = false;
     while (!recoveryCancelled()) {
         PltLockMutex(&matRecoveryMutex);
-        MAT_V2_PHASE phase = matV2Phase;
-        MAT_BACKGROUND background = matBgRequest;
-        bool pauseConfirmed = matBgSuspended && !matBgAwait;
-        bool resendBackground = (matBgAwait || matBgWaitingPrepare) && PltGetMillis() >= matBgRetryAt;
-        if (resendBackground) matBgRetryAt = PltGetMillis() + 1000;
-        MAT_AUDIO_RECOVERY message = matV2Profile;
-        uint64_t deadline = matV2Deadline;
-        bool report = matV2Report, resend = matV2ResendReady;
-        bool stableNotifications = matV2StableSent && matCallbacks.reportsFailures;
-        matV2Report = matV2ResendReady = false;
+        MAT_V2_PHASE phase = matV2.phase;
+        MAT_BACKGROUND background = matBackground.request;
+        bool pauseConfirmed = matBackground.suspended && !matBackground.awaitingReply;
+        bool resendBackground = (matBackground.awaitingReply || matBackground.waitingPrepare) && PltGetMillis() >= matBackground.retryAt;
+        if (resendBackground) matBackground.retryAt = PltGetMillis() + 1000;
+        MAT_AUDIO_RECOVERY message = matV2.profile;
+        uint64_t deadline = matV2.deadline;
+        bool report = matV2.report, resend = matV2.resendReady;
+        bool stableNotifications = matV2.stableSent && matCallbacks.reportsFailures;
+        matV2.report = matV2.resendReady = false;
         PltUnlockMutex(&matRecoveryMutex);
 
         if (phase == MAT_V2_BACKGROUND) {
@@ -1315,10 +1315,10 @@ static void MatRecoveryV2ThreadProc(void) {
             }
             PltLockMutex(&matRecoveryMutex);
             unsigned reason = atomic_load(&matRecoveryBlocked) ? MAT_RECOVERY_BLOCKED : MAT_RECOVERY_RETRYABLE;
-            report = matV2Profile.generation == message.generation && matV2SentFailure != reason &&
-                     ((report && !matV2PeerFailure) ||
-                      (reason == MAT_RECOVERY_BLOCKED && matV2PeerFailure == MAT_RECOVERY_RETRYABLE));
-            if (report) matV2SentFailure = reason;
+            report = matV2.profile.generation == message.generation && matV2.sentFailure != reason &&
+                     ((report && !matV2.peerFailure) ||
+                      (reason == MAT_RECOVERY_BLOCKED && matV2.peerFailure == MAT_RECOVERY_RETRYABLE));
+            if (report) matV2.sentFailure = reason;
             PltUnlockMutex(&matRecoveryMutex);
             if (report) {
                 message.reason = atomic_load(&matRecoveryBlocked) ? MAT_RECOVERY_BLOCKED : MAT_RECOVERY_RETRYABLE;
@@ -1326,7 +1326,7 @@ static void MatRecoveryV2ThreadProc(void) {
                     memset(&message, 0, sizeof(message));
                     message.version = 2;
                     message.previousEpoch = matRecoveryEpoch;
-                    message.generation = matV2InstalledGeneration;
+                    message.generation = matV2.installedGeneration;
                     message.reason = atomic_load(&matRecoveryBlocked) ? MAT_RECOVERY_BLOCKED : MAT_RECOVERY_RETRYABLE;
                     if (!matV2Send(&message, MAT_RECOVERY_REQUEST)) return;
                 }
@@ -1364,7 +1364,7 @@ static void MatRecoveryV2ThreadProc(void) {
             AudioPingPayload.sequenceNumber = 0;
             matRecoveryEpoch = message.newEpoch;
             PltLockMutex(&matRecoveryMutex);
-            matV2InstalledGeneration = message.generation;
+            matV2.installedGeneration = message.generation;
             PltUnlockMutex(&matRecoveryMutex);
             if (!initializeAudioEndpoint() || !matV2Current(message.generation) ||
                 prepareAudioGeneration(matAudioContext, matAudioFlags) != 0 ||
@@ -1372,15 +1372,15 @@ static void MatRecoveryV2ThreadProc(void) {
                 matV2Fail(message.generation); continue;
             }
             PltLockMutex(&matRecoveryMutex);
-            bool current = matV2Profile.generation == message.generation && matV2Phase == MAT_V2_PENDING;
+            bool current = matV2.profile.generation == message.generation && matV2.phase == MAT_V2_PENDING;
             if (current && PltGetMillis() >= deadline) {
-                matV2Phase = MAT_V2_FAILED;
-                matV2Report = true;
+                matV2.phase = MAT_V2_FAILED;
+                matV2.report = true;
                 current = false;
             }
             if (current) {
-                matV2Profile.clientPort = message.clientPort;
-                matV2Phase = MAT_V2_READY;
+                matV2.profile.clientPort = message.clientPort;
+                matV2.phase = MAT_V2_READY;
             }
             PltUnlockMutex(&matRecoveryMutex);
             if (!current || recoveryCancelled()) continue;
@@ -1390,8 +1390,8 @@ static void MatRecoveryV2ThreadProc(void) {
             if (PltGetMillis() >= deadline) { matV2Fail(message.generation); continue; }
             if (resend && !matV2Send(&message, MAT_RECOVERY_READY)) return;
             PltLockMutex(&matRecoveryMutex);
-            bool start = matV2Profile.generation == message.generation && matV2Phase == MAT_V2_READY && matV2Start;
-            if (start) matV2Phase = MAT_V2_CONFIRMING;
+            bool start = matV2.profile.generation == message.generation && matV2.phase == MAT_V2_READY && matV2.start;
+            if (start) matV2.phase = MAT_V2_CONFIRMING;
             PltUnlockMutex(&matRecoveryMutex);
             if (start) {
                 if (!matV2Current(message.generation) || startAudioGeneration() != 0 || atomic_load(&matRecoveryBlocked))
@@ -1407,13 +1407,13 @@ static void MatRecoveryV2ThreadProc(void) {
                 int progress = matCallbacks.progress ? matCallbacks.progress(matCallbacks.context, message.newEpoch, message.domain) : -1;
                 if (atomic_load(&matRecoveryBlocked) || progress < 0) { matV2Fail(message.generation); continue; }
                 PltLockMutex(&matRecoveryMutex);
-                bool current = matV2Profile.generation == message.generation &&
-                    (matV2Phase == MAT_V2_CONFIRMING || matV2Phase == MAT_V2_PLAYING);
-                bool timedOut = current && matV2Phase == MAT_V2_CONFIRMING && PltGetMillis() >= matV2Deadline;
-                bool playing = current && !timedOut && (progress & 1) && !matV2PlayingSent;
-                bool stable = current && !timedOut && (progress & 3) == 3 && !matV2StableSent;
-                if (playing) { matV2PlayingSent = true; matV2Phase = MAT_V2_PLAYING; }
-                if (stable) matV2StableSent = true;
+                bool current = matV2.profile.generation == message.generation &&
+                    (matV2.phase == MAT_V2_CONFIRMING || matV2.phase == MAT_V2_PLAYING);
+                bool timedOut = current && matV2.phase == MAT_V2_CONFIRMING && PltGetMillis() >= matV2.deadline;
+                bool playing = current && !timedOut && (progress & 1) && !matV2.playingSent;
+                bool stable = current && !timedOut && (progress & 3) == 3 && !matV2.stableSent;
+                if (playing) { matV2.playingSent = true; matV2.phase = MAT_V2_PLAYING; }
+                if (stable) matV2.stableSent = true;
                 PltUnlockMutex(&matRecoveryMutex);
                 if (playing && !matV2Send(&message, MAT_RECOVERY_PLAYING)) return;
                 if (stable && !matV2Send(&message, MAT_RECOVERY_STABLE)) return;
@@ -1421,9 +1421,9 @@ static void MatRecoveryV2ThreadProc(void) {
             }
         }
         PltLockMutex(&matRecoveryMutex);
-        bool sleepUntilEvent = matV2Phase == MAT_V2_PLAYING && matV2StableSent &&
-                               matCallbacks.reportsFailures && !matV2ResendReady;
-        sleepUntilEvent |= matV2Phase == MAT_V2_BACKGROUND && matBgSuspended && !matBgAwait && stopped;
+        bool sleepUntilEvent = matV2.phase == MAT_V2_PLAYING && matV2.stableSent &&
+                               matCallbacks.reportsFailures && !matV2.resendReady;
+        sleepUntilEvent |= matV2.phase == MAT_V2_BACKGROUND && matBackground.suspended && !matBackground.awaitingReply && stopped;
         // Clear only while the phase is still stable. A producer changing the
         // phase or queuing another PREPARE then signals after acquiring this mutex.
         if (sleepUntilEvent) PltClearEvent(&matRecoveryEvent);
