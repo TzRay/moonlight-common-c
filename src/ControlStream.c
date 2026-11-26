@@ -668,7 +668,8 @@ static void freeBasicLbqList(PLINKED_BLOCKING_QUEUE_ENTRY entry) {
 
 // Cleans up control stream
 void destroyControlStream(void) {
-    LC_ASSERT(stopping);
+    // An initialized control stream can be destroyed before its transports start.
+    LC_ASSERT(stopping || (ctlSock == INVALID_SOCKET && client == NULL && peer == NULL));
     PltDestroyCryptoContext(encryptionCtx);
     PltDestroyCryptoContext(decryptionCtx);
     PltCloseEvent(&idrFrameRequiredEvent);
