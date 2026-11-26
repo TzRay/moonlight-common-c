@@ -41,14 +41,19 @@ static void serve(void* context) {
         int current = atoi(sequence + 6);
         char body[2048] = "", headers[2048] = "";
         if (!strncmp(request, "DESCRIBE ", 9)) {
-            snprintf(body, sizeof(body),
-                "v=0\r\na=x-ss-audio.mat-live:1\r\n"
-                "a=x-ss-audio.mat-live-carrier:" MAT_CARRIER "\r\n"
-                "a=x-ss-audio.mat-live-clock:" MAT_CLOCK "\r\n"
-                "a=x-ss-audio.mat-live-crypto:" MAT_LIVE_CRYPTO "\r\n"
-                "a=x-ss-audio.mat-live-epoch:7\r\na=x-ss-audio.mat-live-domain:9\r\n"
-                "a=x-ss-general.encryptionSupported:%u\r\n%s",
-                peer->encryptedControl ? SS_ENC_CONTROL_V2 : 0, peer->offer);
+            if (strstr(peer->offer, "a=x-ss-audio.mat-unavailable:")) {
+                snprintf(body, sizeof(body), "v=0\r\na=x-ss-general.encryptionSupported:%u\r\n%s",
+                         peer->encryptedControl ? SS_ENC_CONTROL_V2 : 0, peer->offer);
+            } else {
+                snprintf(body, sizeof(body),
+                    "v=0\r\na=x-ss-audio.mat-live:1\r\n"
+                    "a=x-ss-audio.mat-live-carrier:" MAT_CARRIER "\r\n"
+                    "a=x-ss-audio.mat-live-clock:" MAT_CLOCK "\r\n"
+                    "a=x-ss-audio.mat-live-crypto:" MAT_LIVE_CRYPTO "\r\n"
+                    "a=x-ss-audio.mat-live-epoch:7\r\na=x-ss-audio.mat-live-domain:9\r\n"
+                    "a=x-ss-general.encryptionSupported:%u\r\n%s",
+                    peer->encryptedControl ? SS_ENC_CONTROL_V2 : 0, peer->offer);
+            }
         }
         else if (!strncmp(request, "SETUP ", 6)) {
             unsigned port = strstr(request, "streamid=audio") ? 53000 :
@@ -97,7 +102,8 @@ static void run(const char* name, const char* offer, const char* confirmation,
     peer.confirmation = confirmation;
     peer.encryptedControl = encryptedControl;
     peer.pingIdentity = pingIdentity;
-    peer.mat = mat;
+    bool unavailable = strstr(offer, "a=x-ss-audio.mat-unavailable:") != NULL;
+    peer.mat = mat && !unavailable;
     peer.expectedEcho = expectedEcho;
     peer.listener = createSocket(AF_INET, SOCK_STREAM, IPPROTO_TCP, false);
     CHECK(peer.listener != INVALID_SOCKET);
@@ -115,8 +121,8 @@ static void run(const char* name, const char* offer, const char* confirmation,
     memset(&LocalAddr, 0, sizeof(LocalAddr));
     ((struct sockaddr_in*)&LocalAddr)->sin_family = AF_INET;
     AddrLen = sizeof(address);
-    NegotiatedAudioCodec = mat ? AUDIO_CODEC_MAT_LIVE : AUDIO_CODEC_OPUS;
-    StreamConfig.audioCodec = NegotiatedAudioCodec;
+    NegotiatedAudioCodec = mat || unavailable ? AUDIO_CODEC_MAT_LIVE : AUDIO_CODEC_OPUS;
+    StreamConfig.audioCodec = !mat && unavailable ? AUDIO_CODEC_MAT_AUTO : NegotiatedAudioCodec;
     ConnectionInterrupted = false;
     CHECK(initializeAudioStream() == 0);
     PLT_THREAD thread;
@@ -129,7 +135,8 @@ static void run(const char* name, const char* offer, const char* confirmation,
     destroyAudioStream();
     CHECK(result == expectedResult);
     CHECK(NegotiatedMatAudioRecovery == expectedRecovery);
-    CHECK(peer.announces == 1);
+    CHECK(peer.announces == (unavailable && mat ? 0 : 1));
+    if (unavailable && !mat) CHECK(NegotiatedAudioCodec == AUDIO_CODEC_OPUS);
     if(expectedRecovery==2)CHECK(NegotiatedMatAudioSsrc==123456);
     printf("PASS %s: result=%d recovery=%d\n", name, result, NegotiatedMatAudioRecovery);
 }
@@ -148,6 +155,10 @@ int main(void) {
     StreamConfig.audioConfiguration = AUDIO_CONFIGURATION_STEREO;
     StreamConfig.streamingRemotely = STREAM_CFG_LOCAL;
     run("three-phase agreement", offer, confirmation, true, true, true, true, 0, true);
+    run("missing encoder, strict", "a=x-ss-audio.mat-unavailable:1\r\n", "", true, true, true, 0, ML_ERROR_MAT_ENCODER_MISSING, 0);
+    run("incompatible encoder, strict", "a=x-ss-audio.mat-unavailable:2\r\n", "", true, true, true, 0, ML_ERROR_MAT_ENCODER_INCOMPATIBLE, 0);
+    run("missing encoder, auto", "a=x-ss-audio.mat-unavailable:1\r\n", "", true, true, false, 0, 0, 0);
+    run("incompatible encoder, auto", "a=x-ss-audio.mat-unavailable:2\r\n", "", true, true, false, 0, 0, 0);
     run("old host resets capability", "", "", true, true, true, false, 0, false);
     run("offer without confirmation", offer, "", true, true, true, true, 0, false);
     run("unsolicited confirmation", "", confirmation, true, true, true, false, -1, false);

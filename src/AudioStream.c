@@ -69,6 +69,7 @@ static bool matV2AcceptRtp(const uint8_t* bytes, size_t length) {
 typedef struct {
     uint64_t nextLogUs, packets, lastReceiveUs, maxReceiveGapUs;
     uint64_t maxQueueAgeUs, maxConsumeUs, consumeBuckets[4];
+    uint64_t currentSubmitUs, slowStartUs, slowQueueUs, slowProcessUs, slowSubmitUs;
     unsigned peakQueue;
     uint64_t lastKernelUs, kernelIntervals, missingKernelIntervals, maxKernelGapUs, lastCompleteUs;
     uint16_t lastSequence;
@@ -78,6 +79,7 @@ typedef struct {
     uint64_t gapSamples;
 } MAT_AUDIO_DIAGNOSTICS;
 static MAT_AUDIO_DIAGNOSTICS matReceiveDiagnostics, matDecodeDiagnostics;
+#define MAT_PACKET_QUEUE_BOUND 512
 static void recordMatGap(MAT_AUDIO_DIAGNOSTICS* d, uint64_t gap) {
     unsigned bucket = gap >= 64000 ? 2560 : (unsigned)(gap / 25);
     ++d->gapHistogram[bucket];
@@ -132,6 +134,12 @@ static void logMatAudioDiagnostics(MAT_AUDIO_DIAGNOSTICS* d, const char* worker,
     Limelog("MAT gaps worker=%s samples=%llu p99FloorUs=%u kernelIntervals=%llu missingKernelIntervals=%llu maxKernelGapUs=%llu\n",
         worker, (unsigned long long)d->gapSamples, matGapP99(d), (unsigned long long)d->kernelIntervals,
         (unsigned long long)d->missingKernelIntervals, (unsigned long long)d->maxKernelGapUs);
+    if (d->slowStartUs) {
+        Limelog("MAT slowest decode: epoch=%llu startUs=%llu queueUs=%llu authenticateReassembleUs=%llu rendererSubmitUs=%llu\n",
+            (unsigned long long)MatLiveProfile.epoch, (unsigned long long)d->slowStartUs,
+            (unsigned long long)d->slowQueueUs, (unsigned long long)d->slowProcessUs, (unsigned long long)d->slowSubmitUs);
+        d->slowStartUs = 0;
+    }
     d->nextLogUs = now + 5000000;
     d->maxReceiveGapUs = d->maxQueueAgeUs = d->maxConsumeUs = 0;
     d->peakQueue = 0;
@@ -165,6 +173,13 @@ static int matEnd(void* context,uint64_t cycles) {
     atomic_store_explicit(&matInputEnded,true,memory_order_relaxed);
     return matCallbacks.end(context,cycles);
 }
+static int timedMatCycle(void* context, const unsigned char* data, int size, uint64_t epoch,
+                         uint64_t domain, uint64_t index, uint64_t pts) {
+    uint64_t start = PltGetMicroseconds();
+    int result = matCallbacks.cycle(context, data, size, epoch, domain, index, pts);
+    matDecodeDiagnostics.currentSubmitUs = PltGetMicroseconds() - start;
+    return result;
+}
 static bool matInputTimedOut(void) {
     if(!AUDIO_CODEC_IS_MAT(NegotiatedAudioCodec)||atomic_load_explicit(&matInputEnded,memory_order_relaxed))return false;
     // The decoder can publish a newer timestamp while the receive thread runs.
@@ -177,10 +192,21 @@ static void failMatInput(void) { MatLivePlaybackFail(matLive); }
 static void consumeAudio(char* data,int size, uint64_t readyUs) {
     if(NegotiatedAudioCodec==AUDIO_CODEC_MAT_LIVE) {
         uint64_t started = PltGetMicroseconds();
+        matDecodeDiagnostics.currentSubmitUs = 0;
         int result=MatLivePlaybackPush(matLive,(unsigned char*)data,(size_t)(size>0?size:0));
         uint64_t elapsed = PltGetMicroseconds() - started;
         ++matDecodeDiagnostics.packets;
-        if (elapsed > matDecodeDiagnostics.maxConsumeUs) matDecodeDiagnostics.maxConsumeUs = elapsed;
+        if (elapsed > matDecodeDiagnostics.maxConsumeUs) {
+            matDecodeDiagnostics.maxConsumeUs = elapsed;
+            // An ordinary generation submits a carrier every 20 ms. Keep the
+            // components of the same outlier so unrelated maxima aren't added.
+            if (elapsed >= 20000 && result != 2) {
+                matDecodeDiagnostics.slowStartUs = started;
+                matDecodeDiagnostics.slowQueueUs = readyUs && started >= readyUs ? started - readyUs : 0;
+                matDecodeDiagnostics.slowSubmitUs = matDecodeDiagnostics.currentSubmitUs;
+                matDecodeDiagnostics.slowProcessUs = elapsed - matDecodeDiagnostics.currentSubmitUs;
+            }
+        }
         ++matDecodeDiagnostics.consumeBuckets[elapsed < 100 ? 0 : elapsed < 1000 ? 1 : elapsed < 10000 ? 2 : 3];
         if (result == 1) {
             atomic_fetch_add_explicit(&matCompletedCycles, 1, memory_order_relaxed);
@@ -849,7 +875,7 @@ static int prepareAudioGeneration(void* audioContext, int arFlags) {
     OPUS_MULTISTREAM_CONFIGURATION chosenConfig;
 
     LC_ASSERT(packetQueue.currentSize == 0);
-    packetQueue.sizeBound = AUDIO_CODEC_IS_MAT(NegotiatedAudioCodec) ? 512 : 30;
+    packetQueue.sizeBound = AUDIO_CODEC_IS_MAT(NegotiatedAudioCodec) ? MAT_PACKET_QUEUE_BOUND : 30;
     if (AUDIO_CODEC_IS_MAT(NegotiatedAudioCodec) && !matPoolReady) {
         err = LbqInitializeLinkedBlockingQueue(&matFreePackets, packetQueue.sizeBound);
         if (err != 0) {
@@ -880,6 +906,7 @@ static int prepareAudioGeneration(void* audioContext, int arFlags) {
     audioPrepared = true;
 
     LI_MAT_PLAYBACK_CALLBACKS callbacks=matCallbacks;callbacks.end=matCallbacks.end?matEnd:NULL;
+    if (callbacks.cycle) callbacks.cycle = timedMatCycle;
     if(AUDIO_CODEC_IS_MAT(NegotiatedAudioCodec)) {
         atomic_store_explicit(&matInputEnded,false,memory_order_relaxed);
         atomic_store_explicit(&matLastAcceptedMs,PltGetMillis(),memory_order_relaxed);

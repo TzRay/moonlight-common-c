@@ -1369,7 +1369,12 @@ int performRtspHandshake(PSERVER_INFORMATION serverInfo) {
             memset(&MatLiveProfile,0,sizeof(MatLiveProfile));
             if(StreamConfig.audioCodec!=AUDIO_CODEC_MAT_AUTO) {
                 Limelog("Host has no compatible live MAT source/profile\n");
-                ret=-1;freeMessage(&response);goto Exit;
+                uint32_t reason = 0;
+                parseSdpAttributeToUInt(response.payload, "a=x-ss-audio.mat-unavailable:", &reason);
+                ret = reason == 1 ? ML_ERROR_MAT_ENCODER_MISSING :
+                      reason == 2 ? ML_ERROR_MAT_ENCODER_INCOMPATIBLE : -1;
+                freeMessage(&response);
+                goto Exit;
             }
             NegotiatedAudioCodec=AUDIO_CODEC_OPUS;NegotiatedAudioBitrate=0;
             Limelog("Live MAT source unavailable; selecting Opus before ANNOUNCE (no replay fallback)\n");

@@ -12,6 +12,8 @@ static SOCKET testBindUdpSocket(int, struct sockaddr_storage*, SOCKADDR_LEN, int
 #include <stdarg.h>
 
 static atomic_int failures, initialized, cleaned, terminated, delivered, readyCount, requestCount;
+static atomic_bool rejectNextWrite;
+static atomic_uint lastRequestReason;
 static SOCKET serverSocket;
 static uint16_t oldPort;
 static MAT_AUDIO_RECOVERY prepared;
@@ -48,6 +50,7 @@ static int cycle(void* context,const uint8_t* bytes,int length,uint64_t epoch,ui
     CHECK(context == (void*)(uintptr_t)atomic_load(&initialized));
     CHECK(epoch == MatLiveProfile.epoch && domain == 7 && index == 0 && pts == 0);
     CHECK(length == MAT_WIRE_CYCLE && !memcmp(bytes,expected,sizeof(expected)));
+    if (atomic_exchange(&rejectNextWrite, false)) return 0;
     atomic_fetch_add(&delivered,1);return 1;
 }
 static int end(void* context,uint64_t count) {(void)context;(void)count;return 1;}
@@ -65,6 +68,7 @@ static void logger(const char* format,...) {va_list args;va_start(args,format);v
 
 int testSendRecoveryControl(const MAT_AUDIO_RECOVERY* message) {
     if(message->verb==MAT_RECOVERY_REQUEST){
+        atomic_store(&lastRequestReason,message->reason);
         atomic_fetch_add(&requestCount,1);
         if (testVersion == 2) return 0;
         MAT_AUDIO_RECOVERY next={0};next.verb=MAT_RECOVERY_PREPARE;next.generation=1;
@@ -88,13 +92,37 @@ static bool awaitCount(atomic_int* value,int count) {
     while(atomic_load(value)<count&&PltGetMillis()<deadline)PltSleepMs(2);
     return atomic_load(value)>=count;
 }
+
+// Sunshine learns the media destination from a ping for this generation.
+static bool awaitAudioPing(uint16_t port, const void* token) {
+    uint64_t deadline = PltGetMillis() + 2000;
+    struct pollfd socket = {0};
+    socket.fd = serverSocket;
+    socket.events = POLLIN;
+    for (;;) {
+        uint64_t now = PltGetMillis();
+        if (now >= deadline || pollSockets(&socket, 1, (int)(deadline - now)) <= 0) return false;
+        SS_PING ping;
+        struct sockaddr_in from;
+        SOCKADDR_LEN length = sizeof(from);
+        int received = recvfrom(serverSocket, (char*)&ping, sizeof(ping), 0, (struct sockaddr*)&from, &length);
+        if (received < 0) return false;
+        if (received == (int)sizeof(ping) && from.sin_addr.s_addr == htonl(INADDR_LOOPBACK) &&
+            ntohs(from.sin_port) == port && !memcmp(ping.payload, token, sizeof(ping.payload))) return true;
+    }
+}
+
 static void sendPacketWithSsrc(uint16_t port,uint16_t rtpSequence,const uint8_t* bytes,uint32_t ssrc) {
     uint8_t packet[sizeof(RTP_PACKET)+MAT_LIVE_PACKET];
     PRTP_PACKET rtp=(PRTP_PACKET)packet;memset(rtp,0,sizeof(*rtp));
     rtp->header=0x80;rtp->packetType=97;rtp->sequenceNumber=BE16(rtpSequence);rtp->timestamp=BE32(rtpSequence);rtp->ssrc=BE32(ssrc);
     memcpy(rtp+1,bytes,MAT_LIVE_PACKET);
     struct sockaddr_in peer={0};peer.sin_family=AF_INET;peer.sin_addr.s_addr=htonl(INADDR_LOOPBACK);peer.sin_port=htons(port);
-    CHECK(sendto(serverSocket,(char*)packet,sizeof(packet),0,(struct sockaddr*)&peer,sizeof(peer))==sizeof(packet));
+    int sent=sendto(serverSocket,(char*)packet,sizeof(packet),0,(struct sockaddr*)&peer,sizeof(peer));
+    if (sent != (int)sizeof(packet))
+        fprintf(stderr,"Test UDP write: port=%u sequence=%u ssrc=%u sent=%d error=%d\n",
+                port,rtpSequence,ssrc,sent,LastSocketError());
+    CHECK(sent==(int)sizeof(packet));
 }
 static void sendPacket(uint16_t port,uint16_t sequence,const uint8_t* bytes) {
     sendPacketWithSsrc(port,sequence,bytes,NegotiatedMatAudioSsrc);
@@ -117,6 +145,7 @@ static void setup(bool failRenderer) {
     atomic_store(&progressValue,0);atomic_store(&progressEpoch,0);atomic_store(&forcedPort,0);
     atomic_store(&initialized,0);atomic_store(&cleaned,0);atomic_store(&terminated,0);
     atomic_store(&delivered,0);atomic_store(&readyCount,0);atomic_store(&requestCount,0);
+    atomic_store(&rejectNextWrite,false);atomic_store(&lastRequestReason,0);
     memset(&prepared,0,sizeof(prepared));
     ConnectionInterrupted=false;LiClearStreamSockets();
     LiInitializeStreamConfiguration(&StreamConfig);
@@ -138,6 +167,7 @@ static void setup(bool failRenderer) {
     CHECK(!matReceiveDiagnostics.gapSamples && !matDecodeDiagnostics.gapSamples);
     CHECK(notifyAudioPortNegotiationComplete()==0);
     oldPort=audioSocketPort(rtpSocket);CHECK(startAudioStream((void*)0x1234,17)==0);
+    CHECK(awaitAudioPing(oldPort, AudioPingPayload.payload));
 }
 static void teardown(void) {
     stopAudioStream();destroyAudioStream();closeSocket(serverSocket);
@@ -154,6 +184,7 @@ static void restartAndRejectOldEpoch(void) {
     start.verb=MAT_RECOVERY_START;queueMatAudioRecoveryControl(&start);queueMatAudioRecoveryControl(&start);
     uint64_t deadline=PltGetMillis()+2000;
     while(PltGetMillis()<deadline){PltLockMutex(&matRecoveryMutex);bool busy=matRecoveryBusy;PltUnlockMutex(&matRecoveryMutex);if(!busy)break;PltSleepMs(1);}
+    CHECK(awaitAudioPing(start.clientPort, start.token));
     sendCycle(start.clientPort,456);CHECK(awaitCount(&delivered,2));
     CHECK(atomic_load(&initialized)==2&&atomic_load(&requestCount)==1);
     // A packet authenticated for the old epoch cannot enter new playback.
@@ -183,6 +214,7 @@ static MAT_AUDIO_RECOVERY v2Start(int ready) {
         if(running||PltGetMillis()>=deadline)break;
         PltSleepMs(1);
     }
+    CHECK(awaitAudioPing(start.clientPort, start.token));
     return start;
 }
 static void oldPackets(uint16_t port,uint64_t epoch,uint32_t ssrc,uint32_t outer) {
@@ -268,6 +300,34 @@ static void blockedV2PreservesConnection(void) {
     teardown();blockDuringCleanup=false;
 }
 
+// A SHIELD AudioTrack invalidated by HDMI removal rejects the next authenticated
+// cycle. Only the existing recovery worker may replace that audio generation.
+static void lostRendererRecoversOnReplacement(void) {
+    testVersion=2;
+    setup(false);
+    atomic_store(&rejectNextWrite,true);
+    sendCycle(oldPort,123);
+    CHECK(awaitCount(&requestCount,1));
+    CHECK(atomic_load(&lastRequestReason)==MAT_RECOVERY_RETRYABLE);
+    CHECK(!atomic_load(&delivered) && !atomic_load(&terminated));
+    v2Prepare(1,456);
+    MAT_AUDIO_RECOVERY replacement=v2Start(1);
+    sendCycle(replacement.clientPort,456);
+    CHECK(awaitCount(&delivered,1));
+    CHECK(!atomic_load(&playingCount));
+    atomic_store(&progressEpoch,456);
+    atomic_store(&progressValue,1);
+    CHECK(awaitCount(&playingCount,1));
+    atomic_store(&progressValue,3);
+    CHECK(awaitCount(&stableCount,1));
+    CHECK(atomic_load(&initialized)==2 && atomic_load(&cleaned)==1);
+    CHECK(atomic_load(&requestCount)==1 && !atomic_load(&terminated));
+    printf("Rejected renderer write: requests=%d initializations=%d delivered=%d playing=%d stable=%d terminations=%d\n",
+           atomic_load(&requestCount),atomic_load(&initialized),atomic_load(&delivered),
+           atomic_load(&playingCount),atomic_load(&stableCount),atomic_load(&terminated));
+    teardown();
+}
+
 int main(void) {
     CHECK(initializePlatform()==0);CHECK(PltCreateMutex(&testMutex)==0);
     restartAndRejectOldEpoch();
@@ -280,6 +340,7 @@ int main(void) {
     repeatedV2WithOldPort();
     failedV2CannotRevive();
     blockedV2PreservesConnection();
+    lostRendererRecoversOnReplacement();
     PltDeleteMutex(&testMutex);cleanupPlatform();
     printf("MAT audio recovery: failures=%d\n",atomic_load(&failures));
     return atomic_load(&failures)?1:0;

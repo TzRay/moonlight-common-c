@@ -579,6 +579,8 @@ typedef void(*ConnListenerConnectionTerminated)(int errorCode);
 // endpoint-refresh API. The conservative implementation no longer returns
 // this code because a probe timeout is not proof that the session failed.
 #define ML_ERROR_ENDPOINT_REFRESH_FAILED -106
+#define ML_ERROR_MAT_ENCODER_MISSING -107
+#define ML_ERROR_MAT_ENCODER_INCOMPATIBLE -108
 
 // This callback is invoked to log debug message
 typedef void(*ConnListenerLogMessage)(const char* format, ...);

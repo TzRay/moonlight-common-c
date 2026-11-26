@@ -5,6 +5,10 @@
 #include <stdio.h>
 
 static int failures, cycles, ends, terminated, concealed, opusPackets, workerStarts;
+#ifndef LC_AUDIO_FEC_VALIDATION
+static uint64_t queueClockUs = 1000000;
+static unsigned rendererDelayUs;
+#endif
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "line %d: %s\n", __LINE__, #x); ++failures; } } while (0)
 static MAT_LIVE_CIPHER cipher;
 static reed_solomon* senderRs;
@@ -23,6 +27,9 @@ static int cycle(void* context, const uint8_t* bytes, int n,
                  uint64_t epoch, uint64_t domain, uint64_t index, uint64_t pts) {
     uint8_t expected[MAT_WIRE_CYCLE];
     (void)context;
+#ifndef LC_AUDIO_FEC_VALIDATION
+    queueClockUs += rendererDelayUs;
+#endif
     makeCarrier(expected, (unsigned)cycles);
     CHECK(n == MAT_WIRE_CYCLE && epoch == 123 && domain == 7);
     CHECK(index == (unsigned)cycles && pts == index * 960);
@@ -112,6 +119,8 @@ static void endBlock(TEST_BLOCK* block, unsigned count, uint32_t hash) {
 static void beginSession(void) {
     uint8_t plain[MAT_WIRE_PACKET], wire[MAT_LIVE_PACKET];
     LI_MAT_PLAYBACK_CALLBACKS cb = {0}; cb.cycle = cycle; cb.end = end;
+    LiSetMatPlaybackCallbacks(&cb);
+    cb.cycle = timedMatCycle;
     cycles = ends = terminated = concealed = opusPackets = 0;
     atomic_store(&matFailureReported, false); atomic_store(&matSuppressedFailures, 0);
     atomic_store(&matCompletedCycles, 0); atomic_store(&matPendingPackets, 0);
@@ -152,8 +161,6 @@ static void fecRoundTrip(unsigned omitted, bool reordered, bool lateFinalBlock) 
     closeSession();
 }
 #ifndef LC_AUDIO_FEC_VALIDATION
-static uint64_t queueClockUs = 1000000;
-
 uint64_t MatRtpTestMicroseconds(void) {
     return queueClockUs;
 }
@@ -238,18 +245,21 @@ static void workerCallback(void) {
 }
 static void queueOverflow(void) {
     beginSession();
-    CHECK(LbqInitializeLinkedBlockingQueue(&packetQueue, 1) == 0);
-    PQUEUED_AUDIO_PACKET first = calloc(1, sizeof(*first));
+    CHECK(LbqInitializeLinkedBlockingQueue(&packetQueue, MAT_PACKET_QUEUE_BOUND) == 0);
+    for (int i = 0; i < MAT_PACKET_QUEUE_BOUND; ++i) {
+        PQUEUED_AUDIO_PACKET packet = calloc(1, sizeof(*packet));
+        CHECK(packet && queuePacketToLbq(&packet) && packet == NULL);
+        free(packet);
+    }
     PQUEUED_AUDIO_PACKET rejected = calloc(1, sizeof(*rejected));
-    CHECK(first && rejected);
-    if (first && rejected) {
-        CHECK(queuePacketToLbq(&first) && first == NULL);
-        CHECK(atomic_load(&matPendingPackets) == 1 && matReceiveDiagnostics.peakQueue == 1);
+    CHECK(rejected);
+    if (rejected) {
+        CHECK(atomic_load(&matPendingPackets) == MAT_PACKET_QUEUE_BOUND && matReceiveDiagnostics.peakQueue == MAT_PACKET_QUEUE_BOUND);
         CHECK(!queuePacketToLbq(&rejected) && rejected != NULL);
-        CHECK(terminated == 1 && atomic_load(&matPendingPackets) == 1);
+        CHECK(terminated == 1 && atomic_load(&matPendingPackets) == MAT_PACKET_QUEUE_BOUND);
         CHECK(!queuePacketToLbq(&rejected) && terminated == 1);
     }
-    free(first); free(rejected);
+    free(rejected);
     LbqSignalQueueShutdown(&packetQueue);
     freePacketList(LbqDestroyLinkedBlockingQueue(&packetQueue));
     closeSession();
@@ -302,6 +312,14 @@ int main(void) {
         delayedMatBlock(whole, 14001, false);
     }
     permanentLoss(false); permanentLoss(true); queueOverflow(); opusRecovery(); longReorderedStream();
+    // Reproduce the duration seen in the SHIELD trace at a known boundary.
+    rendererDelayUs = 278848;
+    fecRoundTrip(0, false, false);
+    CHECK(matDecodeDiagnostics.slowSubmitUs == rendererDelayUs && matDecodeDiagnostics.slowProcessUs == 0);
+    printf("Renderer stall control: submitUs=%llu processUs=%llu queueCapacity=%u\n",
+           (unsigned long long)matDecodeDiagnostics.slowSubmitUs, (unsigned long long)matDecodeDiagnostics.slowProcessUs,
+           MAT_PACKET_QUEUE_BOUND);
+    rendererDelayUs = 0;
 #endif
     reed_solomon_release(senderRs); cleanupPlatform();
     if (failures) return 1;
