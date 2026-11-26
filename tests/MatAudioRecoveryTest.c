@@ -463,6 +463,13 @@ static void negotiatedBackground(void) {
     LiSetMatBackgroundPaused(123, false);
     queueMatBackgroundControl(&oldPause);
     CHECK(awaitCount(&bgSentCount, 5) && atomic_load(&cleaned) == 1);
+    MAT_BACKGROUND blocked = latestBg();
+    blocked.verb = MAT_BG_RESUMING;
+    queueMatBackgroundControl(&blocked);
+    blocked.verb = MAT_BG_BLOCKED; // Source failed before a new PREPARE existed.
+    queueMatBackgroundControl(&blocked);
+    CHECK(awaitCount(&cleaned, 2) && atomic_load(&matRecoveryBlocked));
+    CHECK(!atomic_load(&terminated));
     teardown();
     CHECK(!LiGetMatBackgroundSession());
     LiSetMatBackgroundPaused(123, true); // Late UI event during session teardown.
