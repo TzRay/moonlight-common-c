@@ -21,6 +21,7 @@ static int consumeCycle(void* context,const unsigned char* bytes,int n,uint64_t 
 }
 static int consumeEnd(void* context,uint64_t count){(void)context;CHECK(count==1);testNow+=5000;CHECK(!matInputTimedOut());++ended;return !rejectEnd;}
 static void terminate(int error){(void)error;++terminated;}
+extern void registerLegacyMatClient(void*);
 static void liveCallbacks(void) {
     unsigned char carrier[MAT_WIRE_CYCLE]={0},packet[MAT_WIRE_PACKET],wire[MAT_LIVE_PACKET],key[16]={0};
     memcpy(carrier,"\x72\xf8\x1f\x4e\x16\x00\x02\x00",8);
@@ -28,7 +29,13 @@ static void liveCallbacks(void) {
     LI_MAT_LIVE_PROFILE profile={1,1};
     CHECK(MatLiveCipherInit(&cipher,key,sizeof(key),1,1));
     LI_MAT_PLAYBACK_CALLBACKS callbacks={consumeCycle,consumeEnd,NULL,NULL,NULL};
-    LiSetMatPlaybackCallbacks(&callbacks);ListenerCallbacks.connectionTerminated=terminate;
+    LiSetMatPlaybackCallbacksEx(&callbacks, sizeof(callbacks)); snapshotMatCallbacks();ListenerCallbacks.connectionTerminated=terminate;
+    registerLegacyMatClient(&received);
+    CHECK(matCallbacks.context == NULL && matCallbacks.cycle == consumeCycle);
+    snapshotMatCallbacks();
+    CHECK(matCallbacks.context == &received && !matCallbacks.threadStart && !matCallbacks.progress);
+    LiSetMatPlaybackCallbacksEx(&callbacks, sizeof(callbacks));
+    snapshotMatCallbacks();
     for(int test=0;test<4;test++) {
         received=ended=terminated=0;rejectCycle=test==1;rejectEnd=test==2;
         atomic_store(&matFailureReported,false);matPlaybackCompleteReported=false;NegotiatedAudioCodec=AUDIO_CODEC_MAT_LIVE;
@@ -47,7 +54,7 @@ static void liveCallbacks(void) {
         CHECK(received==1);CHECK(ended==(test==0||test==2));CHECK(terminated==(test==1||test==2));
         MatLivePlaybackClose(matLive);matLive=NULL;
     }
-    LiSetMatPlaybackCallbacks(NULL);
+    LiSetMatPlaybackCallbacksEx(NULL, 0); snapshotMatCallbacks();
     CHECK(MatLivePlaybackOpen(&profile,key,&matCallbacks)==NULL);
 }
 static void watchdog(void) {

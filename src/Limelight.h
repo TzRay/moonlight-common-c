@@ -5,6 +5,7 @@
 #pragma once
 
 #include <stdint.h>
+#include <stddef.h>
 #include <stdbool.h>
 
 #include "PyrowaveProtocol.h"
@@ -333,6 +334,10 @@ typedef struct {
 } LI_MAT_PLAYBACK_CALLBACKS;
 #define LI_MAT_THREAD_RECEIVE 0
 #define LI_MAT_THREAD_DECODE 1
+// Legacy symbol reads the original three fields (cycle, end, context).
+// Use the sized entry point for optional callbacks. Registration takes effect
+// at the next successful audio init. Retain context until that generation's cleanup.
+void LiSetMatPlaybackCallbacksEx(const LI_MAT_PLAYBACK_CALLBACKS* callbacks, size_t size);
 void LiSetMatPlaybackCallbacks(const LI_MAT_PLAYBACK_CALLBACKS* callbacks);
 void LiBlockMatAudioRecovery(void);
 
@@ -409,6 +414,9 @@ void LiBlockMatAudioRecovery(void);
 // If set in the video renderer capabilities field, the renderer accepts the
 // experimental PyroWave frame contract and owns the GPU decode path.
 #define CAPABILITY_PYROWAVE 0x100
+
+// Local audio renderer can report actual MAT playhead progress before RTSP negotiation.
+#define CAPABILITY_MAT_PLAYBACK_PROGRESS 0x00800000
 
 // If set in the video renderer capabilities field, this macro specifies that the renderer
 // supports slicing to increase decoding performance. The parameter specifies the desired

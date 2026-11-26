@@ -1530,7 +1530,7 @@ int performRtspHandshake(PSERVER_INFORMATION serverInfo) {
             MatSdpValue(response.payload, "x-ss-audio.mat-live-recovery",
                         matRecoveryVersion, sizeof(matRecoveryVersion)) == 1 &&
             !strcmp(matRecoveryVersion, "1");
-        if (MatAudioRecoveryOffered &&
+        if (MatAudioRecoveryOffered && (AudioCallbacks.capabilities & CAPABILITY_MAT_PLAYBACK_PROGRESS) &&
             MatSdpValue(response.payload, "x-ss-audio.mat-live-recovery-v2",
                         matRecoveryVersion, sizeof(matRecoveryVersion)) == 1 && !strcmp(matRecoveryVersion, "1"))
             MatAudioRecoveryOffered = 2;
