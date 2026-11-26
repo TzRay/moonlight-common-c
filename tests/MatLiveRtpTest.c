@@ -7,7 +7,7 @@
 static int failures, cycles, ends, terminated, concealed, opusPackets, workerStarts;
 #ifndef LC_AUDIO_FEC_VALIDATION
 static uint64_t queueClockUs = 1000000;
-static unsigned rendererDelayUs;
+static int rendererDelayUs;
 #endif
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "line %d: %s\n", __LINE__, #x); ++failures; } } while (0)
 static MAT_LIVE_CIPHER cipher;
@@ -353,6 +353,9 @@ int main(void) {
     }
     permanentLoss(false); permanentLoss(true); queueOverflow(); opusRecovery(); longReorderedStream();
     // Reproduce the duration seen in the SHIELD trace at a known boundary.
+    rendererDelayUs = -100;
+    fecRoundTrip(0, false, false);
+    CHECK(matDecodeDiagnostics.maxConsumeUs == 0 && matDecodeDiagnostics.slowStartUs == 0);
     rendererDelayUs = 278848;
     fecRoundTrip(0, false, false);
     CHECK(matDecodeDiagnostics.slowSubmitUs == rendererDelayUs && matDecodeDiagnostics.slowProcessUs == 0);
