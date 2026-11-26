@@ -1,6 +1,12 @@
 /* Real AudioStream workers, sockets, RTP, authentication and generation cleanup.
  * The host control transport and Android renderer are deterministic local fakes. */
 #include "Limelight-internal.h"
+#include "PlatformCrypto.h"
+static atomic_bool failNextContext;
+static PPLT_CRYPTO_CONTEXT testCreateCryptoContext(void) {
+    return atomic_exchange(&failNextContext, false) ? NULL : PltCreateCryptoContext();
+}
+#define PltCreateCryptoContext testCreateCryptoContext
 int testSendRecoveryControl(const MAT_AUDIO_RECOVERY*);
 static SOCKET testBindUdpSocket(int, struct sockaddr_storage*, SOCKADDR_LEN, int, int);
 #define bindUdpSocket testBindUdpSocket
@@ -173,6 +179,18 @@ static void teardown(void) {
     stopAudioStream();destroyAudioStream();closeSocket(serverSocket);
     LI_STREAM_SOCKETS sockets;LiGetStreamSockets(&sockets);CHECK(sockets.audioRtp.fd==-1);
 }
+
+static void generationAllocationFailure(void) {
+    atomic_store(&failNextContext, true);
+    CHECK(initializeAudioStream() != 0);
+    CHECK(audioDecryptionCtx == NULL && rtpAudioQueue.rs == NULL);
+    setup(false);
+    atomic_store(&failNextContext, true);
+    CHECK(requestMatAudioRecovery(1));
+    CHECK(awaitCount(&terminated, 1));
+    teardown();
+    CHECK(audioDecryptionCtx == NULL && rtpAudioQueue.rs == NULL);
+}
 static void restartAndRejectOldEpoch(void) {
     setup(false);sendCycle(oldPort,123);CHECK(awaitCount(&delivered,1));
     CHECK(requestMatAudioRecovery(1));CHECK(awaitCount(&readyCount,1));
@@ -330,6 +348,7 @@ static void lostRendererRecoversOnReplacement(void) {
 
 int main(void) {
     CHECK(initializePlatform()==0);CHECK(PltCreateMutex(&testMutex)==0);
+    generationAllocationFailure();
     restartAndRejectOldEpoch();
     setup(false);
     MAT_AUDIO_RECOVERY host={0};host.verb=MAT_RECOVERY_PREPARE;host.generation=1;

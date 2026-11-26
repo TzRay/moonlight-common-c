@@ -23,7 +23,7 @@
 #define RTP_PAYLOAD_TYPE_AUDIO   97
 #define RTP_PAYLOAD_TYPE_FEC     127
 
-void RtpaInitializeQueue(PRTP_AUDIO_QUEUE queue) {
+bool RtpaInitializeQueue(PRTP_AUDIO_QUEUE queue) {
     memset(queue, 0, sizeof(*queue));
 
     // We will start in the synchronizing state, where we wait for the first
@@ -53,6 +53,7 @@ void RtpaInitializeQueue(PRTP_AUDIO_QUEUE queue) {
     // The number of data and parity shards is constant, so we can reuse
     // the same RS matrices for all traffic.
     queue->rs = reed_solomon_new(RTPA_DATA_SHARDS, RTPA_FEC_SHARDS);
+    if (!queue->rs) return false;
 
     // For unknown reasons, the RS parity matrix computed by our RS implementation
     // doesn't match the one Nvidia uses for audio data. I'm not exactly sure why,
@@ -61,6 +62,7 @@ void RtpaInitializeQueue(PRTP_AUDIO_QUEUE queue) {
     // constant and known in advance.
     const unsigned char parity[] = { 0x77, 0x40, 0x38, 0x0e, 0xc7, 0xa7, 0x0d, 0x6c };
     memcpy(queue->rs->p, parity, sizeof(parity));
+    return true;
 }
 
 static void validateFecBlockState(PRTP_AUDIO_QUEUE queue) {
