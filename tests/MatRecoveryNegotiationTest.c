@@ -58,9 +58,13 @@ static void serve(void* context) {
         else if (!strncmp(request, "SETUP ", 6)) {
             unsigned port = strstr(request, "streamid=audio") ? 53000 :
                             strstr(request, "streamid=video") ? 52998 : 52999;
+            char transport[128];
+            if (port == 53000) snprintf(transport, sizeof(transport), "unicast;server_port=%u-%u;source=127.0.0.1", port, port + 1);
+            else if (port == 52998) snprintf(transport, sizeof(transport), "x-server_port=2;server_port=%u", port);
+            else snprintf(transport, sizeof(transport), "server_port=%u-invalid", port);
             snprintf(headers, sizeof(headers),
-                "Session: recovery-test\r\nTransport: server_port=%u\r\n"
-                "X-SS-Connect-Data: 123\r\n%s", port,
+                "Session: recovery-test\r\nTransport: %s\r\n"
+                "X-SS-Connect-Data: 123\r\n%s", transport,
                 peer->pingIdentity ? "X-SS-Ping-Payload: 0123456789abcdef\r\n" : "");
         }
         else if (!strncmp(request, "ANNOUNCE ", 9)) {
@@ -134,6 +138,7 @@ static void run(const char* name, const char* offer, const char* confirmation,
     closeSocket(peer.listener);
     destroyAudioStream();
     CHECK(result == expectedResult);
+    if (result == 0) CHECK(AudioPortNumber == 53000 && VideoPortNumber == 52998 && ControlPortNumber == 47999);
     CHECK(NegotiatedMatAudioRecovery == expectedRecovery);
     CHECK(peer.announces == (unavailable && mat ? 0 : 1));
     if (unavailable && !mat) CHECK(NegotiatedAudioCodec == AUDIO_CODEC_OPUS);
@@ -156,6 +161,10 @@ int main(void) {
     StreamConfig.streamingRemotely = STREAM_CFG_LOCAL;
     run("three-phase agreement", offer, confirmation, true, true, true, true, 0, true);
     run("missing encoder, strict", "a=x-ss-audio.mat-unavailable:1\r\n", "", true, true, true, 0, ML_ERROR_MAT_ENCODER_MISSING, 0);
+    run("invalid decimal suffix", "a=x-ss-audio.mat-unavailable:1x\r\n", "", true, true, true, 0, -1, 0);
+    run("overflowing reason", "a=x-ss-audio.mat-unavailable:4294967297\r\n", "", true, true, true, 0, -1, 0);
+    run("conflicting reasons", "a=x-ss-audio.mat-unavailable:1\r\na=x-ss-audio.mat-unavailable:2\r\n",
+        "", true, true, true, 0, -1, 0);
     run("incompatible encoder, strict", "a=x-ss-audio.mat-unavailable:2\r\n", "", true, true, true, 0, ML_ERROR_MAT_ENCODER_INCOMPATIBLE, 0);
     run("missing encoder, auto", "a=x-ss-audio.mat-unavailable:1\r\n", "", true, true, false, 0, 0, 0);
     run("incompatible encoder, auto", "a=x-ss-audio.mat-unavailable:2\r\n", "", true, true, false, 0, 0, 0);

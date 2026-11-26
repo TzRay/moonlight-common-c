@@ -1,6 +1,7 @@
 #include "DynamicHdr.h"
 #include "Limelight-internal.h"
 #include "Rtsp.h"
+#include <errno.h>
 
 /* MAT playback confirmation is security/format critical: duplicates fail even
  * if they repeat the same value. Header names are ASCII case-insensitive. */
@@ -949,30 +950,32 @@ static int parseOpusConfigFromParamString(char* paramStr, int channelCount, POPU
 // Parse the server port from the Transport header
 // Example: unicast;server_port=48000-48001;source=192.168.35.177
 static bool parseServerPortFromTransport(PRTSP_MESSAGE response, uint16_t* port) {
-    char* transport;
-    char* portStart;
-
-    transport = getOptionContent(response->options, "Transport");
-    if (transport == NULL) {
-        return false;
+    const char* transport = getOptionContent(response->options, "Transport");
+    uint16_t selected = 0;
+    for (const char* field = transport; field && *field;) {
+        const char* end = strchr(field, ';');
+        if (!end) end = field + strlen(field);
+        while (field < end && (*field == ' ' || *field == '\t')) ++field;
+        if ((size_t)(end - field) >= 12 && !memcmp(field, "server_port=", 12)) {
+            const char* value = field + 12;
+            char* tail;
+            if (selected || *value < '0' || *value > '9') return false;
+            long first = strtol(value, &tail, 10);
+            if (first < 1 || first > UINT16_MAX) return false;
+            if (*tail == '-') {
+                value = tail + 1;
+                if (*value < '0' || *value > '9') return false;
+                long last = strtol(value, &tail, 10);
+                if (last < first || last > UINT16_MAX) return false;
+            }
+            while (tail < end && (*tail == ' ' || *tail == '\t')) ++tail;
+            if (tail != end) return false;
+            selected = (uint16_t)first;
+        }
+        field = *end ? end + 1 : end;
     }
-
-    // Look for the server_port= entry in the Transport option
-    portStart = strstr(transport, "server_port=");
-    if (portStart == NULL) {
-        return false;
-    }
-
-    // Skip the prefix
-    portStart += strlen("server_port=");
-
-    // Validate the port number
-    long int rawPort = strtol(portStart, NULL, 10);
-    if (rawPort <= 0 || rawPort > 65535) {
-        return false;
-    }
-
-    *port = (uint16_t)rawPort;
+    if (!selected) return false;
+    *port = selected;
     return true;
 }
 
@@ -1155,41 +1158,16 @@ static bool parseUrlAddrFromRtspUrlString(const char* rtspUrlString, char* desti
 
 // SDP attributes are in the form:
 // a=x-nv-bwe.bwuSafeZoneLowLimit:70\r\n
-bool parseSdpAttributeToUInt(const char* payload, const char* name, uint32_t* val) {
-    // Find the entry for the specified attribute name
-    char* attribute = strstr(payload, name);
-    if (!attribute) {
-        return false;
-    }
-
-    // Locate the start of the value
-    char* valst = strstr(attribute, ":");
-    if (!valst) {
-        return false;
-    }
-
-    // Read the integer up to the newline at the end of the SDP attribute
-    *val = strtoul(valst + 1, NULL, 0);
-
-    return true;
-}
-
-bool parseSdpAttributeToInt(const char* payload, const char* name, int* val) {
-    // Find the entry for the specified attribute name
-    char* attribute = strstr(payload, name);
-    if (!attribute) {
-        return false;
-    }
-
-    // Locate the start of the value
-    char* valst = strstr(attribute, ":");
-    if (!valst) {
-        return false;
-    }
-
-    // Read the integer up to the newline at the end of the SDP attribute
-    *val = strtol(valst + 1, NULL, 0);
-
+static bool parseSdpAttributeToUInt(const char* payload, const char* name, uint32_t* value) {
+    char field[64];
+    if (MatSdpValue(payload, name, field, sizeof(field)) != 1) return false;
+    const char* start = field + strspn(field, " \t");
+    if (*start < '0' || *start > '9') return false;
+    char* end;
+    errno = 0;
+    unsigned long long parsed = strtoull(start, &end, 0);
+    if (errno == ERANGE || parsed > UINT32_MAX || end[strspn(end, " \t")]) return false;
+    *value = (uint32_t)parsed;
     return true;
 }
 
@@ -1370,7 +1348,7 @@ int performRtspHandshake(PSERVER_INFORMATION serverInfo) {
             if(StreamConfig.audioCodec!=AUDIO_CODEC_MAT_AUTO) {
                 Limelog("Host has no compatible live MAT source/profile\n");
                 uint32_t reason = 0;
-                parseSdpAttributeToUInt(response.payload, "a=x-ss-audio.mat-unavailable:", &reason);
+                parseSdpAttributeToUInt(response.payload, "x-ss-audio.mat-unavailable", &reason);
                 ret = reason == 1 ? ML_ERROR_MAT_ENCODER_MISSING :
                       reason == 2 ? ML_ERROR_MAT_ENCODER_INCOMPATIBLE : -1;
                 freeMessage(&response);
