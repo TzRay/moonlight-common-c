@@ -233,11 +233,14 @@ static int matEnd(void* context,uint64_t cycles) {
     atomic_store_explicit(&matInputEnded,true,memory_order_relaxed);
     return matCallbacks.end(context,cycles);
 }
+static uint64_t elapsedMatUs(uint64_t start, uint64_t end) {
+    return end >= start ? end - start : 0;
+}
 static int timedMatCycle(void* context, const unsigned char* data, int size, uint64_t epoch,
                          uint64_t domain, uint64_t index, uint64_t pts) {
     uint64_t start = PltGetMicroseconds();
     int result = matCallbacks.cycle(context, data, size, epoch, domain, index, pts);
-    matDecodeDiagnostics.currentSubmitUs = PltGetMicroseconds() - start;
+    matDecodeDiagnostics.currentSubmitUs = elapsedMatUs(start, PltGetMicroseconds());
     return result;
 }
 static bool matInputTimedOut(void) {
@@ -254,7 +257,9 @@ static void consumeAudio(char* data,int size, uint64_t readyUs) {
         uint64_t started = PltGetMicroseconds();
         matDecodeDiagnostics.currentSubmitUs = 0;
         int result=MatLivePlaybackPush(matLive,(unsigned char*)data,(size_t)(size>0?size:0));
-        uint64_t elapsed = PltGetMicroseconds() - started;
+        uint64_t finished = PltGetMicroseconds();
+        uint64_t elapsed = elapsedMatUs(started, finished);
+        logMatAudioDiagnostics(&matDecodeDiagnostics, "decode", false, finished);
         ++matDecodeDiagnostics.packets;
         if (elapsed > matDecodeDiagnostics.maxConsumeUs) {
             matDecodeDiagnostics.maxConsumeUs = elapsed;
@@ -264,7 +269,7 @@ static void consumeAudio(char* data,int size, uint64_t readyUs) {
                 matDecodeDiagnostics.slowStartUs = started;
                 matDecodeDiagnostics.slowQueueUs = readyUs && started >= readyUs ? started - readyUs : 0;
                 matDecodeDiagnostics.slowSubmitUs = matDecodeDiagnostics.currentSubmitUs;
-                matDecodeDiagnostics.slowProcessUs = elapsed - matDecodeDiagnostics.currentSubmitUs;
+                matDecodeDiagnostics.slowProcessUs = elapsedMatUs(matDecodeDiagnostics.currentSubmitUs, elapsed);
             }
         }
         ++matDecodeDiagnostics.consumeBuckets[elapsed < 100 ? 0 : elapsed < 1000 ? 1 : elapsed < 10000 ? 2 : 3];
@@ -280,7 +285,6 @@ static void consumeAudio(char* data,int size, uint64_t readyUs) {
             reportMatFailure("authentication_sequence_or_renderer",&matDecodeDiagnostics,0,0,-1);
         }
         else if(result==2&&!matPlaybackCompleteReported){matPlaybackCompleteReported=true;Limelog("Live MAT authenticated EOS and renderer drain completed\n");}
-        logMatAudioDiagnostics(&matDecodeDiagnostics, "decode", false, PltGetMicroseconds());
         return;
     }
     AudioCallbacks.decodeAndPlaySample(data,size);
@@ -865,7 +869,9 @@ static void AudioDecoderThreadProc(void* context) {
 
         if (AUDIO_CODEC_IS_MAT(NegotiatedAudioCodec)) {
             atomic_fetch_sub_explicit(&matPendingPackets, 1, memory_order_relaxed);
-            uint64_t age = PltGetMicroseconds() - packet->header.queuedAtUs;
+            uint64_t dequeued = PltGetMicroseconds();
+            logMatAudioDiagnostics(&matDecodeDiagnostics, "decode", false, dequeued);
+            uint64_t age = elapsedMatUs(packet->header.queuedAtUs, dequeued);
             if (age > matDecodeDiagnostics.maxQueueAgeUs) matDecodeDiagnostics.maxQueueAgeUs = age;
         }
         decodeInputData(packet);
