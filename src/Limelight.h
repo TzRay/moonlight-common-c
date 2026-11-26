@@ -343,6 +343,10 @@ typedef struct {
 void LiSetMatPlaybackCallbacksEx(const LI_MAT_PLAYBACK_CALLBACKS* callbacks, size_t size);
 void LiSetMatPlaybackCallbacks(const LI_MAT_PLAYBACK_CALLBACKS* callbacks);
 void LiBlockMatAudioRecovery(void);
+// Capture the token in renderer init. A later failure, PREPARE or visibility change
+// invalidates it while init is pending. Initial setup returns zero.
+uint64_t LiGetMatAudioPreparationToken(void);
+bool LiIsMatAudioPreparationCancelled(uint64_t token);
 // A renderer may call this from any thread. Retired audio identities are ignored.
 void LiNotifyMatPlaybackFailure(uint64_t epoch, uint64_t domain);
 

@@ -13,8 +13,9 @@ offline input, native capture, encoding or hardware rendering.
   select Opus; stale or mismatched MAT acknowledgements fail the handshake.
 - Carrier `iec61937-192000-8-s16le` carries 61,440 bytes per 20 ms cycle. The SMAT
   clock is 48,000 Hz / 960 ticks per cycle. RTP fragment ticks are not media PTS.
-- `LiSetMatPlaybackCallbacks` registers the live consumer during audio init and
-  is cleared after threads join. Consumers copy borrowed bytes before returning;
+- `LiSetMatPlaybackCallbacksEx` registers the live consumer with its callback structure size during audio init.
+  Cleanup clears the snapshot after the audio threads join. The original registration API accepts its three legacy fields.
+  Consumers copy borrowed bytes before returning;
   zero means failure. The end callback requires authenticated, complete END and
   must finish any bounded drain before returning success. Closing or timing out
   cannot synthesize successful EOS.

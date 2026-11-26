@@ -20,7 +20,8 @@ int testSendBackgroundControl(const MAT_BACKGROUND*);
 #include <stdarg.h>
 
 static atomic_int failures, initialized, cleaned, terminated, delivered, readyCount, requestCount;
-static atomic_bool rejectNextWrite;
+static atomic_bool rejectNextWrite, holdNextPrepare, failControlSend;
+static atomic_int preparationEntered, preparationCancelled;
 static atomic_uint lastRequestReason;
 static SOCKET serverSocket;
 static uint16_t oldPort;
@@ -34,7 +35,7 @@ int testSendBackgroundControl(const MAT_BACKGROUND* message) {
     bgSent = *message;
     PltUnlockMutex(&testMutex);
     atomic_fetch_add(&bgSentCount, 1);
-    return 0;
+    return atomic_exchange(&failControlSend, false) ? -1 : 0;
 }
 static MAT_BACKGROUND latestBg(void) {
     PltLockMutex(&testMutex);
@@ -83,6 +84,16 @@ static int end(void* context,uint64_t count) {(void)context;(void)count;return 1
 static int rendererInit(int configuration,POPUS_MULTISTREAM_CONFIGURATION opus,void* context,int flags) {
     (void)configuration;(void)opus;CHECK(context==(void*)0x1234&&flags==17);
     int count=atomic_fetch_add(&initialized,1)+1;
+    if (atomic_exchange(&holdNextPrepare, false)) {
+        uint64_t token = LiGetMatAudioPreparationToken();
+        CHECK(token && !LiIsMatAudioPreparationCancelled(token));
+        atomic_store(&preparationEntered, 1);
+        uint64_t deadline = PltGetMillis() + 2500;
+        while (!LiIsMatAudioPreparationCancelled(token) && PltGetMillis() < deadline) PltSleepMs(1);
+        CHECK(LiIsMatAudioPreparationCancelled(token));
+        atomic_store(&preparationCancelled, 1);
+        return -1;
+    }
     if(failNewRenderer&&count==2)return -1;
     LI_MAT_PLAYBACK_CALLBACKS cb={cycle,end,(void*)(uintptr_t)count,NULL,rendererProgress,eventRenderer};
     LiSetMatPlaybackCallbacksEx(&cb, eventRenderer ? sizeof(cb) : offsetof(LI_MAT_PLAYBACK_CALLBACKS, reportsFailures));return 0;
@@ -94,6 +105,7 @@ static void terminate(int error){(void)error;atomic_fetch_add(&terminated,1);}
 static void logger(const char* format,...) {va_list args;va_start(args,format);vfprintf(stderr,format,args);va_end(args);}
 
 int testSendRecoveryControl(const MAT_AUDIO_RECOVERY* message) {
+    if (atomic_exchange(&failControlSend, false)) return -1;
     if(message->verb==MAT_RECOVERY_REQUEST){
         atomic_store(&lastRequestReason,message->reason);
         atomic_fetch_add(&requestCount,1);
@@ -489,6 +501,44 @@ static void negotiatedBackground(void) {
     teardown();
 }
 
+static void cancelPreparingGeneration(bool suspend) {
+    NegotiatedMatBackground = suspend;
+    setup(false);
+    atomic_store(&preparationEntered, 0);
+    atomic_store(&preparationCancelled, 0);
+    atomic_store(&holdNextPrepare, true);
+    v2Prepare(1, 456);
+    CHECK(awaitCount(&preparationEntered, 1));
+    if (suspend) {
+        LiSetMatBackgroundPaused(123, true);
+    } else {
+        v2Prepare(2, 789);
+    }
+    CHECK(awaitCount(&preparationCancelled, 1));
+    if (!suspend) {
+        CHECK(awaitCount(&readyCount, 1));
+        PltLockMutex(&testMutex);
+        CHECK(prepared.generation == 2);
+        PltUnlockMutex(&testMutex);
+    }
+    CHECK(!atomic_load(&terminated));
+    teardown();
+    NegotiatedMatBackground = false;
+}
+
+static void controlFailureRetiresAudio(bool background) {
+    NegotiatedMatBackground = background;
+    setup(false);
+    atomic_store(&failControlSend, true);
+    if (background) LiSetMatBackgroundPaused(123, true);
+    else v2Prepare(1, 456);
+    CHECK(awaitCount(&terminated, 1));
+    CHECK(atomic_load(&cleaned) == (background ? 1 : 2));
+    CHECK(!matCallbacks.context && !matCallbacks.progress && !matCallbacks.threadStart);
+    teardown();
+    NegotiatedMatBackground = false;
+}
+
 int main(void) {
     CHECK(initializePlatform()==0);CHECK(PltCreateMutex(&testMutex)==0);
     generationAllocationFailure();
@@ -508,6 +558,10 @@ int main(void) {
     blockedV2PreservesConnection();
     lostRendererRecoversOnReplacement();
     negotiatedBackground();
+    cancelPreparingGeneration(false);
+    cancelPreparingGeneration(true);
+    controlFailureRetiresAudio(false);
+    controlFailureRetiresAudio(true);
     PltDeleteMutex(&testMutex);cleanupPlatform();
     printf("MAT audio recovery: failures=%d\n",atomic_load(&failures));
     return atomic_load(&failures)?1:0;
