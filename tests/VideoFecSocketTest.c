@@ -26,6 +26,24 @@ static void transmit(const void* bytes, size_t size) {
                  (struct sockaddr*)&receiverAddr, AddrLen) == (int)size);
 }
 
+static bool encryptedReplay, lateOriginal, continuousTraffic;
+static unsigned latePackets;
+static PPLT_CRYPTO_CONTEXT encryptCtx;
+static void transmitEncrypted(const void* bytes, size_t size) {
+    uint8_t wire[sizeof(ENC_VIDEO_HEADER) + WIRE] = {0};
+    PENC_VIDEO_HEADER header = (PENC_VIDEO_HEADER)wire;
+    static uint32_t iv;
+    iv++;
+    memcpy(header->iv, &iv, sizeof(iv));
+    header->frameNumber = ((PNV_VIDEO_PACKET)((const uint8_t*)bytes + MAX_RTP_HEADER_SIZE))->frameIndex;
+    int length;
+    CHECK(PltEncryptMessage(encryptCtx, ALGORITHM_AES_GCM, 0,
+                            (unsigned char*)StreamConfig.remoteInputAesKey, sizeof(StreamConfig.remoteInputAesKey),
+                            header->iv, sizeof(header->iv), header->tag, sizeof(header->tag),
+                            (unsigned char*)bytes, (int)size, wire + sizeof(*header), &length));
+    transmit(wire, sizeof(*header) + length);
+}
+
 static unsigned probes, degraded, timedPolls, terminated, mediaPackets;
 static int terminationCode;
 static void recordTermination(int code) { terminated++; terminationCode = code; }
@@ -46,6 +64,14 @@ static int receiveTimed(LI_ENDPOINT_REFRESH* state, SOCKET* s, char* packet, int
             transmit(ack, sizeof(ack));
         }
         if (enabled && probes) endpointOffsetMs = 8100;
+        if (lateOriginal && !latePackets++) {
+            sendShard(NULL, GROUPS - 1, DATA - 1, true, 15);
+        }
+        if (continuousTraffic) {
+            // Duplicate media from a finished group keeps the socket readable.
+            sendShard(NULL, 0, 0, true, 0);
+            nowUs += 1000;
+        }
     }
     int result = LiErClientRecvTimed(state, s, packet, size, fallback, realDeadline, timestamp);
     if (result == LI_ER_RECV_HANDLED) {
@@ -59,7 +85,7 @@ static int receiveTimed(LI_ENDPOINT_REFRESH* state, SOCKET* s, char* packet, int
             timedPolls++;
         } else {
             // The full default wait after the static frame is actual silence.
-            CHECK(delivered == GROUPS * DATA);
+            CHECK(encryptedReplay || delivered == GROUPS * DATA);
             nowUs += 10000000;
         }
     } else {
@@ -75,6 +101,7 @@ static int receiveTimed(LI_ENDPOINT_REFRESH* state, SOCKET* s, char* packet, int
 #include "../src/VideoStream.c"
 
 static void runSocketReplay(bool refresh, bool fallback) {
+    latePackets = 0;
     nowUs = 1000000;
     endpointOffsetMs = 0;
     failTimeout = fallback;
@@ -93,13 +120,30 @@ static void runSocketReplay(bool refresh, bool fallback) {
 
     RtpvInitializeQueue(&rtpQueue);
     prepare(1, 0);
-    staticDesktop(&rtpQueue, 8);
+    uint64_t observed = LiGetObservedVideoDataPackets();
+    uint32_t gaps = LiGetVideoPacketCoverageGaps();
+    if (encryptedReplay) {
+        for (unsigned g = 0; g < GROUPS; g++) {
+            if (g == 1) continue;
+            for (unsigned i = 0; i <= DATA; i++) sendShard(NULL, g, i, false, 0);
+        }
+        sendShardNumber(NULL, 0, 0, false, 0, 2);
+    }
+    else staticDesktop(&rtpQueue, 8);
     VideoReceiveThreadProc(NULL);
-    CHECK(delivered == GROUPS * DATA && repaired == 1 && !lost);
-    CHECK(mediaPackets == 3 * (DATA + 1) + DATA - 1 + 8);
-    CHECK(timedPolls == 1 && terminated == 1 && terminationCode == ML_ERROR_NO_VIDEO_TRAFFIC);
+    CHECK(terminated == 1 && terminationCode == ML_ERROR_NO_VIDEO_TRAFFIC);
+    if (encryptedReplay) {
+        CHECK(!delivered && lost && !repaired && !timedPolls);
+        CHECK(LiGetObservedVideoDataPackets() - observed == 3 * DATA);
+        CHECK(LiGetVideoPacketCoverageGaps() - gaps == 1);
+    }
+    else {
+        CHECK(delivered == GROUPS * DATA && repaired == !lateOriginal && !lost);
+        CHECK(mediaPackets >= 3 * (DATA + 1) + DATA - 1 + 8);
+        CHECK(timedPolls == (!lateOriginal && !continuousTraffic));
+    }
     CHECK(probes == (unsigned)refresh && degraded == (unsigned)refresh);
-    CHECK(lastVideoDataTimeMs == 1000 && firstDataTimeMs == 1000);
+    CHECK(lastVideoDataTimeMs >= 1000 && firstDataTimeMs == 1000);
 
     RtpvCleanupQueue(&rtpQueue);
     LiErClientDestroy(&endpointRefresh);
@@ -126,6 +170,21 @@ int main(void) {
     for (int refresh = 0; refresh <= 1; refresh++) {
         for (int fallback = 0; fallback <= 1; fallback++) runSocketReplay(refresh, fallback);
     }
+    lateOriginal = true;
+    runSocketReplay(false, false);
+    lateOriginal = false;
+    continuousTraffic = true;
+    runSocketReplay(false, false);
+    continuousTraffic = false;
+    encryptedReplay = true;
+    EncryptionFeaturesEnabled |= SS_ENC_VIDEO;
+    encryptCtx = PltCreateCryptoContext();
+    decryptionCtx = PltCreateCryptoContext();
+    CHECK(encryptCtx && decryptionCtx);
+    sendOnSocket = transmitEncrypted;
+    runSocketReplay(false, false);
+    PltDestroyCryptoContext(decryptionCtx);
+    PltDestroyCryptoContext(encryptCtx);
     closeSocket(sender);
     cleanupPlatform();
     puts("static frame over loopback: all refresh and SO_RCVTIMEO configurations passed");

@@ -767,6 +767,15 @@ void connectionRecordFecBlock(uint16_t data, uint16_t received) {
     PltUnlockMutex(&fecSummaryMutex);
 }
 
+void connectionTakeFecSummary(SS_FEC_SUMMARY* summary) {
+    PltLockMutex(&fecSummaryMutex);
+    summary->sequence = BE32(++fecSequence);
+    summary->dataPackets = BE32(fecDataPackets);
+    summary->missingDataPackets = BE32(fecMissingPackets);
+    fecDataPackets = fecMissingPackets = 0;
+    PltUnlockMutex(&fecSummaryMutex);
+}
+
 void connectionRecordVideoCoverageGaps(uint32_t gaps) {
     atomic_fetch_add_explicit(&videoPacketCoverageGaps, gaps, memory_order_relaxed);
 }
@@ -796,7 +805,7 @@ void connectionSendFrameFecStatus(PSS_FRAME_FEC_STATUS fecStatus) {
 }
 
 void connectionSawFrame(uint32_t frameIndex) {
-    LC_ASSERT_VT(!isBefore16(frameIndex, lastSeenFrame));
+    LC_ASSERT_VT(!isBefore32(frameIndex, lastSeenFrame));
 
     uint64_t now = PltGetMillis();
 
@@ -1943,12 +1952,7 @@ static void lossStatsThreadFunc(void* context) {
         while (!PltIsThreadInterrupted(&lossStatsThread)) {
             if (VideoFecControlSupported && PltGetMillis() - fecLastSummaryMs >= 1000) {
                 SS_FEC_SUMMARY summary;
-                PltLockMutex(&fecSummaryMutex);
-                summary.sequence = BE32(++fecSequence);
-                summary.dataPackets = BE32(fecDataPackets);
-                summary.missingDataPackets = BE32(fecMissingPackets);
-                fecDataPackets = fecMissingPackets = 0;
-                PltUnlockMutex(&fecSummaryMutex);
+                connectionTakeFecSummary(&summary);
                 fecLastSummaryMs = PltGetMillis();
                 if (summary.dataPackets && !sendMessageEnet(SS_FEC_SUMMARY_PTYPE, sizeof(summary), &summary,
                                                            CTRL_CHANNEL_GENERIC, 0, false)) {

@@ -16,6 +16,7 @@ void ignoreFrame(uint32_t frame) { (void)frame; }
 void noteStatus(PSS_FRAME_FEC_STATUS status) { (void)status; reports++; }
 bool noSpeculation(void) { return false; }
 
+static unsigned fecPercent;
 static void shard(PRTP_VIDEO_QUEUE queue, uint32_t frame, unsigned count, unsigned block,
                   unsigned data, unsigned index, uint16_t base) {
     size_t length = MAX_RTP_HEADER_SIZE + sizeof(NV_VIDEO_PACKET);
@@ -28,7 +29,7 @@ static void shard(PRTP_VIDEO_QUEUE queue, uint32_t frame, unsigned count, unsign
     nv->frameIndex = LE32(frame);
     nv->multiFecBlocks = ((count - 1) << 6) | (block << 4);
     nv->flags = FLAG_CONTAINS_PIC_DATA | (!index ? FLAG_SOF : 0) | (index + 1 == data ? FLAG_EOF : 0);
-    nv->fecInfo = LE32((data << 22) | (index << 12));
+    nv->fecInfo = LE32((data << 22) | (index << 12) | (fecPercent << 4));
     if (RtpvAddPacket(queue, packet, length, (PRTPV_QUEUE_ENTRY)(bytes + length)) == RTPF_RET_REJECTED) free(bytes);
 }
 
@@ -52,6 +53,17 @@ int main(void) {
     CHECK(LiGetVideoPacketCoverageGaps() == 3 && reports == 0);
     RtpvCleanupQueue(&queue);
 
+    // Rejected sequence numbers and an isolated discontinuity cannot replace
+    // the observation watermark, even on a plaintext stream.
+    RtpvInitializeQueue(&queue);
+    shard(&queue, 1, 1, 0, 3, 0, 0);
+    shard(&queue, 905000, 1, 0, 1, 0, 200);
+    shard(&queue, 8, 1, 0, 1, 0, 65530);
+    shard(&queue, 1, 1, 0, 3, 9, 0);
+    CHECK(queue.currentFrameNumber == 1 && queue.observation.frame == 1);
+    CHECK(LiGetVideoPacketCoverageGaps() == 3);
+    RtpvCleanupQueue(&queue);
+
     // PyroWave feeds each original straight to the depacketizer.
     NegotiatedVideoFormat = VIDEO_FORMAT_PYROWAVE;
     RtpvInitializeQueue(&queue);
@@ -64,6 +76,33 @@ int main(void) {
     CHECK(LiGetObservedVideoDataPackets() == ((UINT64_C(98) << 32) | 136));
     CHECK(LiGetVideoPacketCoverageGaps() == 3);
     RtpvCleanupQueue(&queue);
+    // A parity shard describes the number of originals even when all are lost.
+    CHECK(initializeControlStream() == 0);
+    VideoFecControlSupported = true;
+    NegotiatedVideoFormat = VIDEO_FORMAT_H265;
+    RtpvInitializeQueue(&queue);
+    fecPercent = 25;
+    shard(&queue, 1, 1, 0, 4, 4, 0);
+    fecPercent = 0;
+    shard(&queue, 2, 1, 0, 1, 0, 5);
+    CHECK(LiGetObservedVideoDataPackets() == ((UINT64_C(4) << 32) | 5));
+    CHECK(!LiGetVideoPacketCoverageGaps());
+    SS_FEC_SUMMARY summary;
+    connectionTakeFecSummary(&summary);
+    CHECK(BE32(summary.dataPackets) == 5 && BE32(summary.missingDataPackets) == 4);
+    connectionTakeFecSummary(&summary);
+    CHECK(!summary.dataPackets && !summary.missingDataPackets && BE32(summary.sequence) == 2);
+    RtpvCleanupQueue(&queue);
+    // Older single-block hosts do not define the multi-block fields. A header
+    // with no usable FEC geometry supplies neither a numerator nor a denominator.
+    AppVersionQuad[0] = 4;
+    RtpvInitializeQueue(&queue);
+    shard(&queue, 1, 3, 2, 0, 0, 0);
+    shard(&queue, 1, 3, 2, 1, 0, 0);
+    CHECK(LiGetObservedVideoDataPackets() == ((UINT64_C(4) << 32) | 6));
+    CHECK(!LiGetVideoPacketCoverageGaps());
+    RtpvCleanupQueue(&queue);
+    destroyControlStream();
     cleanupPlatform();
     return 0;
 }

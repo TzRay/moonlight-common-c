@@ -183,13 +183,17 @@ static void VideoReceiveThreadProc(void* context) {
             }
         }
 
-        if (timingEnabled) receiveStartUs = PltGetMicroseconds();
         uint64_t deadlineUs = RtpvGetRecoveryDeadlineUs(&rtpQueue);
         if (deadlineUs) {
             // Also advance while probes, short timeouts or rejected media keep arriving.
-            RtpvExpireRecoveryDeadline(&rtpQueue, PltGetMicroseconds());
+            uint64_t nowUs = PltGetMicroseconds();
+            if (nowUs >= deadlineUs) {
+                RtpvExpireRecoveryDeadline(&rtpQueue, nowUs);
+                if (timingEnabled) recordVideoTiming(VIDEO_TIMING_PACKET_PROCESS, nowUs, PltGetMicroseconds());
+            }
             deadlineUs = RtpvGetRecoveryDeadlineUs(&rtpQueue);
         }
+        if (timingEnabled) receiveStartUs = PltGetMicroseconds();
         err = LiErClientRecvTimed(&endpointRefresh, &rtpSocket,
                                   encrypted ? encryptedBuffer : buffer,
                                   receiveSize, useSelect, deadlineUs, NULL);
@@ -272,7 +276,7 @@ static void VideoReceiveThreadProc(void* context) {
             // couldn't already do. If they're not on-link, we just throw their malicious
             // traffic away (as mentioned in the paragraph above) and continue accepting
             // legitmate video traffic.
-            if (encHeader->frameNumber && LE32(encHeader->frameNumber) < RtpvGetCurrentFrameNumber(&rtpQueue)) {
+            if (encHeader->frameNumber && RtpvShouldDiscardEncryptedFrame(&rtpQueue, LE32(encHeader->frameNumber))) {
                 if (terminateIfVideoTrafficTimedOut()) {
                     break;
                 }
