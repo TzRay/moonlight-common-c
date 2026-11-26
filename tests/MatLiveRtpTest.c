@@ -222,6 +222,26 @@ static void arrivalWindows(void) {
     recordMatArrival(&stats, &packet, queueClockUs + 1, 14000);  // kernel realtime clock rolls back
     CHECK(stats.gapSamples == 3 && stats.kernelIntervals == 1 && stats.missingKernelIntervals == 2);
 }
+
+static void olderBlockBeforeExpiry(void) {
+    uint8_t carrier[MAT_WIRE_CYCLE];
+    TEST_BLOCK first, middle, later;
+    beginSession();
+    makeCarrier(carrier, 0);
+    dataBlock(&first, carrier, 0, 0);
+    dataBlock(&middle, carrier, 0, 4);
+    dataBlock(&later, carrier, 0, 8);
+    packet(later.base, later.shards[0], MAT_LIVE_PACKET);
+    queueClockUs += 13999;
+    packet(middle.base, middle.shards[0], MAT_LIVE_PACKET);
+    CHECK(!terminated && rtpAudioQueue.stats.packetCountFecFailed == 0);
+    queueClockUs += 2;
+    packet(middle.base + 1, middle.shards[1], MAT_LIVE_PACKET);
+    CHECK(terminated == 1 && rtpAudioQueue.stats.packetCountFecFailed == 1);
+    packet(first.base, first.shards[0], MAT_LIVE_PACKET);
+    CHECK(rtpAudioQueue.stats.packetCountFecFailed == 1);
+    closeSession();
+}
 #endif
 
 static void permanentLoss(bool wholeBlock) {
@@ -323,6 +343,7 @@ int main(void) {
     workerCallback(); fecRoundTrip(0, false, false); fecRoundTrip(1, true, false);
 #ifndef LC_AUDIO_FEC_VALIDATION
     arrivalWindows();
+    olderBlockBeforeExpiry();
     fecRoundTrip(3, false, false); fecRoundTrip(3, true, false);
     fecRoundTrip(1u | (1u << 4), true, false); fecRoundTrip(3, true, true);
     for (int whole = 0; whole <= 1; ++whole) {
