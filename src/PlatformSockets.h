@@ -139,7 +139,7 @@ SOCKET bindUdpSocket(int addressFamily, struct sockaddr_storage* localAddr, SOCK
 int enableNoDelay(SOCKET s);
 int setSocketNonBlocking(SOCKET s, bool enabled);
 int recvUdpSocket(SOCKET s, char* buffer, int size, bool useSelect);
-int recvUdpSocketTimed(SOCKET s, char* buffer, int size, bool useSelect, uint64_t* kernelUs);
+int recvUdpSocketTimed(SOCKET s, char* buffer, int size, bool useSelect, uint64_t deadlineUs, uint64_t* kernelUs);
 bool enableUdpReceiveTimestamps(SOCKET s);
 void shutdownTcpSocket(SOCKET s);
 int setNonFatalRecvTimeoutMs(SOCKET s, int timeoutMs);

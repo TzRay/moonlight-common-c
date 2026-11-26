@@ -184,10 +184,15 @@ static void VideoReceiveThreadProc(void* context) {
         }
 
         if (timingEnabled) receiveStartUs = PltGetMicroseconds();
-        err = LiErClientRecv(&endpointRefresh, &rtpSocket,
-                            encrypted ? encryptedBuffer : buffer,
-                            receiveSize,
-                            useSelect);
+        uint64_t deadlineUs = RtpvGetRecoveryDeadlineUs(&rtpQueue);
+        if (deadlineUs) {
+            // Also advance while probes, short timeouts or rejected media keep arriving.
+            RtpvExpireRecoveryDeadline(&rtpQueue, PltGetMicroseconds());
+            deadlineUs = RtpvGetRecoveryDeadlineUs(&rtpQueue);
+        }
+        err = LiErClientRecvTimed(&endpointRefresh, &rtpSocket,
+                                  encrypted ? encryptedBuffer : buffer,
+                                  receiveSize, useSelect, deadlineUs, NULL);
         // Clock reads and diagnostic logging may change errno/WSAGetLastError.
         const int receiveError = err < 0 ? (int)LastSocketError() : 0;
         if (timingEnabled) {

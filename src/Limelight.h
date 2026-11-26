@@ -1320,6 +1320,11 @@ uint64_t LiGetRTPVideoBytesReceived(void);
 // independently and reset on stream initialization. Entirely unseen blocks are excluded.
 uint64_t LiGetObservedVideoDataPackets(void);
 
+// Cumulative per-connection coverage gaps. One per unseen block of a known
+// frame, or per wholly unseen frame (its block count cannot be determined).
+// Compare successive snapshots using unsigned subtraction.
+uint32_t LiGetVideoPacketCoverageGaps(void);
+
 // Returns the percentage of video frames lost by the network during the most
 // recent connection-status sampling interval. Decoder and renderer drops are
 // not included. The value is updated every 3 seconds after the stream settles.

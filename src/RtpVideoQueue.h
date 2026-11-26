@@ -19,6 +19,18 @@ typedef struct _RTPV_QUEUE_LIST {
     uint32_t count;
 } RTPV_QUEUE_LIST, *PRTPV_QUEUE_LIST;
 
+// Observations follow the wire even after the decoder has abandoned a frame.
+typedef struct {
+    uint16_t data, received;
+    uint64_t seen[16]; // Ten-bit original shard indices.
+} RTPV_BLOCK_OBSERVATION;
+
+typedef struct {
+    uint32_t frame;
+    uint8_t count, finalized;
+    RTPV_BLOCK_OBSERVATION blocks[4];
+} RTPV_FRAME_OBSERVATION;
+
 typedef struct _RTP_VIDEO_QUEUE {
     RTPV_QUEUE_LIST pendingFecBlockList;
     RTPV_QUEUE_LIST completedFecBlockList;
@@ -35,7 +47,7 @@ typedef struct _RTP_VIDEO_QUEUE {
     uint32_t receivedHighestSequenceNumber;
     uint32_t fecPercentage;
     uint32_t nextContiguousSequenceNumber;
-    uint64_t pyrowaveReceivedData[16]; // Outer RTP shard indices are 10 bits.
+    RTPV_FRAME_OBSERVATION observation;
     uint32_t missingPackets; // # of holes behind receivedHighestSequenceNumber
     bool useFastQueuePath;
     bool reportedLostFrame;
@@ -60,6 +72,8 @@ typedef struct _RTP_VIDEO_QUEUE {
 #define RTPF_RET_CONSUMED  2
 
 void RtpvInitializeQueue(PRTP_VIDEO_QUEUE queue);
+uint64_t RtpvGetRecoveryDeadlineUs(PRTP_VIDEO_QUEUE queue);
+void RtpvExpireRecoveryDeadline(PRTP_VIDEO_QUEUE queue, uint64_t nowUs);
 void RtpvCleanupQueue(PRTP_VIDEO_QUEUE queue);
 int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_QUEUE_ENTRY packetEntry);
 uint32_t RtpvGetCurrentFrameNumber(PRTP_VIDEO_QUEUE queue);

@@ -639,7 +639,7 @@ static void AudioReceiveThreadProc(void* context) {
         }
 
         uint64_t kernelUs = 0;
-        packet->header.size = LiErClientRecvTimed(&endpointRefresh, &rtpSocket, &packet->data[0], MAX_PACKET_SIZE, useSelect,
+        packet->header.size = LiErClientRecvTimed(&endpointRefresh, &rtpSocket, &packet->data[0], MAX_PACKET_SIZE, useSelect, 0,
                                                   kernelTiming ? &kernelUs : NULL);
         if (packet->header.size == LI_ER_RECV_HANDLED) {
             continue;

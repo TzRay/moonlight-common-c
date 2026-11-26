@@ -248,12 +248,16 @@ if (BUILD_TESTING)
     add_test(NAME video-packet-stats-tests COMMAND video-packet-stats-tests)
 
     add_executable(video-fec-interleave-tests tests/VideoFecInterleaveTest.c)
-    target_include_directories(video-fec-interleave-tests PRIVATE enet/include
-      $<TARGET_PROPERTY:moonlight-common-c,INCLUDE_DIRECTORIES>)
-    target_compile_definitions(video-fec-interleave-tests PRIVATE
-      $<TARGET_PROPERTY:moonlight-common-c,COMPILE_DEFINITIONS>)
-    target_link_libraries(video-fec-interleave-tests PRIVATE moonlight-common-c)
-    add_test(NAME video-fec-interleave-tests COMMAND video-fec-interleave-tests)
+    add_executable(video-fec-socket-tests tests/VideoFecSocketTest.c)
+    foreach(test IN ITEMS video-fec-interleave video-fec-socket)
+      target_include_directories(${test}-tests PRIVATE enet/include
+        $<TARGET_PROPERTY:moonlight-common-c,INCLUDE_DIRECTORIES>)
+      target_compile_definitions(${test}-tests PRIVATE
+        $<TARGET_PROPERTY:moonlight-common-c,COMPILE_DEFINITIONS>)
+      target_link_libraries(${test}-tests PRIVATE moonlight-common-c)
+      add_test(NAME ${test}-tests COMMAND ${test}-tests)
+    endforeach()
+    set_tests_properties(video-fec-socket-tests PROPERTIES TIMEOUT 10)
 
     add_executable(video-receive-error-tests tests/VideoReceiveErrorTest.c)
     target_include_directories(video-receive-error-tests PRIVATE src enet/include)

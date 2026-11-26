@@ -92,9 +92,8 @@ bool VideoFecControlSupported;
 static PLT_MUTEX fecSummaryMutex;
 // High word: missing data packets. Low word: expected data packets in observed blocks.
 static atomic_uint_least64_t observedVideoDataPackets;
-static uint32_t fecDataPackets, fecMissingPackets, fecSequence, fecLastFrame;
-static uint8_t fecLastBlock;
-static bool fecHasBlock;
+static atomic_uint_least32_t videoPacketCoverageGaps;
+static uint32_t fecDataPackets, fecMissingPackets, fecSequence;
 static uint64_t fecLastSummaryMs;
 static bool usePeriodicPing;
 
@@ -598,7 +597,7 @@ int initializeControlStream(void) {
     PltCreateMutex(&fecSummaryMutex);
     fecDataPackets = fecMissingPackets = fecSequence = 0;
     atomic_store_explicit(&observedVideoDataPackets, 0, memory_order_relaxed);
-    fecHasBlock = false;
+    atomic_store_explicit(&videoPacketCoverageGaps, 0, memory_order_relaxed);
     fecLastSummaryMs = PltGetMillis();
 
     encryptedControlStream = APP_VERSION_AT_LEAST(7, 1, 431);
@@ -751,12 +750,9 @@ void connectionReceivedCompleteFrame(uint32_t frameIndex, bool frameIsLTR) {
     }
 }
 
-void connectionRecordFecBlock(uint32_t frame, uint8_t block, uint16_t data, uint16_t received) {
-    // Both RTP paths finalize blocks on the video receive thread.
-    if (!data || received > data || (fecHasBlock && frame == fecLastFrame && block == fecLastBlock)) return;
-    fecLastFrame = frame;
-    fecLastBlock = block;
-    fecHasBlock = true;
+void connectionRecordFecBlock(uint16_t data, uint16_t received) {
+    // The receive thread seals each observed block exactly once.
+    LC_ASSERT(data && received <= data);
     uint64_t previous = atomic_load_explicit(&observedVideoDataPackets, memory_order_relaxed);
     uint32_t total = (uint32_t)previous + data;
     uint32_t missing = (uint32_t)(previous >> 32) + (data - received);
@@ -769,6 +765,14 @@ void connectionRecordFecBlock(uint32_t frame, uint8_t block, uint16_t data, uint
         fecMissingPackets += data - received;
     }
     PltUnlockMutex(&fecSummaryMutex);
+}
+
+void connectionRecordVideoCoverageGaps(uint32_t gaps) {
+    atomic_fetch_add_explicit(&videoPacketCoverageGaps, gaps, memory_order_relaxed);
+}
+
+uint32_t LiGetVideoPacketCoverageGaps(void) {
+    return (uint32_t)atomic_load_explicit(&videoPacketCoverageGaps, memory_order_relaxed);
 }
 
 uint64_t LiGetObservedVideoDataPackets(void) {

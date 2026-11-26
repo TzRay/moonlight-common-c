@@ -171,12 +171,12 @@ void LiErClientMedia(LI_ENDPOINT_REFRESH* state) {
 }
 
 int LiErClientRecv(LI_ENDPOINT_REFRESH* state, SOCKET* socket, char* packet, int size, bool useSelect) {
-    return LiErClientRecvTimed(state, socket, packet, size, useSelect, NULL);
+    return LiErClientRecvTimed(state, socket, packet, size, useSelect, 0, NULL);
 }
 
-int LiErClientRecvTimed(LI_ENDPOINT_REFRESH* state, SOCKET* socket, char* packet, int size, bool useSelect, uint64_t* kernelUs) {
+int LiErClientRecvTimed(LI_ENDPOINT_REFRESH* state, SOCKET* socket, char* packet, int size, bool useSelect, uint64_t deadlineUs, uint64_t* kernelUs) {
     if (!state->initialized || !LiIsEndpointAutoRefreshEnabled()) {
-        return recvUdpSocketTimed(*socket, packet, size, useSelect, kernelUs);
+        return recvUdpSocketTimed(*socket, packet, size, useSelect, deadlineUs, kernelUs);
     }
     uint64_t receiveTime = PltGetMillis();
     if (!state->receiving) {
@@ -186,7 +186,7 @@ int LiErClientRecvTimed(LI_ENDPOINT_REFRESH* state, SOCKET* socket, char* packet
         PltUnlockMutex(&state->mutex);
     }
     maintain(state);
-    int length = recvUdpSocketTimed(state->active, packet, size, useSelect, kernelUs);
+    int length = recvUdpSocketTimed(state->active, packet, size, useSelect, deadlineUs, kernelUs);
     if (length < 0) {
         return length; // Preserve the socket error for the media receiver.
     }

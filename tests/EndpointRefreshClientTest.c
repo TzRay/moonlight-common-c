@@ -8,6 +8,8 @@ CONNECTION_LISTENER_CALLBACKS ListenerCallbacks;
 struct sockaddr_storage RemoteAddr, LocalAddr;
 SOCKADDR_LEN AddrLen = sizeof(struct sockaddr_in);
 static uint64_t now = 10000;
+static uint64_t lastDeadlineUs;
+static SOCKET lastReadSocket;
 static unsigned int socketCreates, socketCloses, clockReads;
 
 uint64_t PltGetMillis(void) { clockReads++; return now; }
@@ -90,9 +92,11 @@ int pollSockets(struct pollfd* fds, int count, int timeout) {
     }
     return result;
 }
-int recvUdpSocketTimed(SOCKET socketValue, char* buffer, int size, bool useSelect, uint64_t* kernelUs) {
+int recvUdpSocketTimed(SOCKET socketValue, char* buffer, int size, bool useSelect, uint64_t deadlineUs, uint64_t* kernelUs) {
     if (kernelUs) *kernelUs = 0;
     (void)useSelect;
+    lastDeadlineUs = deadlineUs;
+    lastReadSocket = socketValue;
     struct pollfd readable = { .fd = socketValue, .events = POLLIN };
     if (pollSockets(&readable, 1, 0) <= 0) {
         return 0;
@@ -215,6 +219,13 @@ int main(void) {
     CHECK(LiErClientRecv(&state, &state.active, (char*)buffer, sizeof(buffer), false) ==
         LI_ER_RECV_HANDLED);
     CHECK(!state.suspect && !state.degraded);
+
+    // Honor the maintained active socket and the caller's fallback separately.
+    CHECK(LiErClientRecvTimed(&state, &host, (char*)buffer, sizeof(buffer), false, 12345, NULL) == 0);
+    CHECK(lastReadSocket == active && lastDeadlineUs == 12345);
+    LiSetEndpointAutoRefreshEnabled(false);
+    CHECK(LiErClientRecvTimed(&state, &host, (char*)buffer, sizeof(buffer), true, 54321, NULL) == 0);
+    CHECK(lastReadSocket == host && lastDeadlineUs == 54321);
 
     LiErClientDestroy(&state);
     closeSocket(active);

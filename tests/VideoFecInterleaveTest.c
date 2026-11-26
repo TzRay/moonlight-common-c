@@ -1,82 +1,4 @@
-// Use the real queue and RS codec; only replace the consumer and network callbacks.
-#define queueRtpPacket capturePacket
-#define notifyFrameLost captureLoss
-#define connectionSawFrame ignoreFrame
-#define connectionRecordFecBlock captureStats
-#define connectionSendFrameFecStatus ignoreStatus
-#define isReferenceFrameInvalidationEnabled allowRfi
-#include "../src/RtpVideoQueue.c"
-#include <stdio.h>
-
-#define CHECK(x) do { if (!(x)) { fprintf(stderr, "line %d: %s\n", __LINE__, #x); exit(1); } } while (0)
-enum { GROUPS = 4, DATA = 32, PARITY = 16, TOTAL = DATA + PARITY, WIRE = 96 };
-static uint8_t original[GROUPS][TOTAL][WIRE];
-static unsigned delivered, lost, repaired, arrival, ready;
-static uint32_t number, first;
-
-bool capturePacket(PRTPV_QUEUE_ENTRY entry) {
-    unsigned g = delivered / DATA, i = delivered % DATA;
-    CHECK(g < GROUPS && !entry->isParity && entry->receiveTimeUs);
-    PNV_VIDEO_PACKET nv = (PNV_VIDEO_PACKET)((uint8_t*)entry->packet + MAX_RTP_HEADER_SIZE);
-    PNV_VIDEO_PACKET expected = (PNV_VIDEO_PACKET)(original[g][i] + MAX_RTP_HEADER_SIZE);
-    CHECK(entry->packet->sequenceNumber == (uint16_t)(first + g * TOTAL + i));
-    CHECK(nv->frameIndex == number && nv->streamPacketIndex == (uint32_t)((first + g * TOTAL + i) << 8));
-    CHECK(nv->flags == expected->flags && nv->multiFecBlocks == expected->multiFecBlocks);
-    CHECK(memcmp(nv + 1, expected + 1, WIRE - MAX_RTP_HEADER_SIZE - sizeof(*nv)) == 0);
-    delivered++;
-    if (delivered == GROUPS * DATA) ready = arrival;
-    free(entry->packet);
-    return true;
-}
-void captureLoss(unsigned frame, bool speculative) { (void)frame; (void)speculative; lost++; }
-void ignoreFrame(uint32_t frame) { (void)frame; }
-void ignoreStatus(PSS_FRAME_FEC_STATUS status) { (void)status; }
-bool allowRfi(void) { return true; }
-void captureStats(uint32_t frame, uint8_t group, uint16_t data, uint16_t received) {
-    (void)frame; (void)group;
-    repaired += data - received;
-}
-
-static void prepare(uint32_t frame, uint32_t base) {
-    number = frame; first = base;
-    delivered = repaired = arrival = ready = 0;
-    memset(original, 0, sizeof(original));
-    reed_solomon* rs = reed_solomon_new(DATA, PARITY);
-    CHECK(rs);
-    for (unsigned g = 0; g < GROUPS; g++) {
-        uint8_t* shards[TOTAL];
-        for (unsigned i = 0; i < TOTAL; i++) {
-            shards[i] = original[g][i];
-            if (i >= DATA) continue;
-            PNV_VIDEO_PACKET nv = (PNV_VIDEO_PACKET)(shards[i] + MAX_RTP_HEADER_SIZE);
-            nv->frameIndex = frame;
-            nv->streamPacketIndex = (base + g * TOTAL + i) << 8;
-            nv->multiFecFlags = 0x10;
-            nv->multiFecBlocks = (GROUPS - 1) << 6 | g << 4;
-            nv->flags = FLAG_CONTAINS_PIC_DATA | (!i ? FLAG_SOF : 0) | (i + 1 == DATA ? FLAG_EOF : 0);
-            for (size_t j = MAX_RTP_HEADER_SIZE + sizeof(*nv); j < WIRE; j++)
-                shards[i][j] = (uint8_t)(frame + g * 19 + i * 67 + j * (i + 3));
-        }
-        CHECK(reed_solomon_encode(rs, shards, TOTAL, WIRE) == 0);
-    }
-    reed_solomon_release(rs);
-}
-
-static void sendShard(PRTP_VIDEO_QUEUE queue, unsigned g, unsigned i, bool mixed, unsigned mask) {
-    uint8_t* bytes = malloc(WIRE + sizeof(RTPV_QUEUE_ENTRY));
-    CHECK(bytes);
-    memcpy(bytes, original[g][i], WIRE);
-    PRTP_PACKET rtp = (PRTP_PACKET)bytes;
-    rtp->header = 0x80 | FLAG_EXTENSION;
-    rtp->sequenceNumber = (uint16_t)(first + g * TOTAL + i);
-    rtp->timestamp = number * 1500;
-    PNV_VIDEO_PACKET nv = (PNV_VIDEO_PACKET)(bytes + MAX_RTP_HEADER_SIZE);
-    nv->frameIndex = LE32(number);
-    nv->multiFecBlocks = (GROUPS - 1) << 6 | g << 4 | mask;
-    nv->fecInfo = LE32(DATA << 22 | i << 12 | 50 << 4 | (mixed ? SS_FEC_INFO_INTERLEAVED : 0));
-    if (RtpvAddPacket(queue, rtp, WIRE, (PRTPV_QUEUE_ENTRY)(bytes + WIRE)) == RTPF_RET_REJECTED)
-        free(bytes);
-}
+#include "VideoFecFixture.h"
 
 static unsigned runFrame(PRTP_VIDEO_QUEUE queue, bool mixed, unsigned dropFirst, bool reorder) {
     unsigned mask = 0;
@@ -95,6 +17,79 @@ static unsigned runFrame(PRTP_VIDEO_QUEUE queue, bool mixed, unsigned dropFirst,
         if (reorder && g == 1 && i == 4) sendShard(queue, g, i, mixed, mask);
     }
     return ready;
+}
+
+static void compareWindows(void) {
+    // Replay the same six final-original delays at each negotiated rate. The
+    // final trace has permanent loss. The final profile varies inter-frame arrival
+    // intervals under a 60 fps negotiation, as on a static or variable-rate desktop.
+    const unsigned rates[] = {30, 60, 120, 240, 60};
+    const unsigned delays[] = {2000, 6000, 10000, 15000, 25000, UINT32_MAX};
+    for (unsigned r = 0; r < sizeof(rates)/sizeof(rates[0]); r++) {
+        StreamConfig.fps = rates[r];
+        unsigned period = 1000000 / rates[r];
+        unsigned bounded = period / 2;
+        if (bounded < 4000) bounded = 4000;
+        if (bounded > 12000) bounded = 12000;
+        const unsigned windows[] = {0, period, bounded};
+        for (unsigned w = 0; w < 3; w++) {
+            unsigned caught = 0, calls = 0, sumUs = 0;
+            for (unsigned t = 0; t < sizeof(delays)/sizeof(delays[0]); t++) {
+                RTP_VIDEO_QUEUE queue;
+                RtpvInitializeQueue(&queue);
+                prepare(1, 0);
+                nowUs += r == 4 ? (t % 2 ? 250000 : 4167) : period;
+                staticDesktop(&queue, 8);
+                CHECK(!delivered && RtpvGetRecoveryDeadlineUs(&queue) == nowUs + bounded);
+                // Override just the deadline for the two comparison arms.
+                if (w != 2) queue.interleaved->blocks[GROUPS - 1].recoveryDeadlineUs = nowUs + windows[w];
+                unsigned before = rsCalls;
+                if (delays[t] < windows[w]) {
+                    nowUs += delays[t];
+                    RtpvExpireRecoveryDeadline(&queue, nowUs);
+                    CHECK(!delivered);
+                    sendShard(&queue, GROUPS - 1, DATA - 1, true, 15);
+                    sumUs += delays[t];
+                    caught++;
+                } else {
+                    if (windows[w]) {
+                        RtpvExpireRecoveryDeadline(&queue, nowUs + windows[w] - 1);
+                        CHECK(!delivered);
+                    }
+                    nowUs += windows[w];
+                    RtpvExpireRecoveryDeadline(&queue, nowUs);
+                    sumUs += windows[w];
+                }
+                CHECK(delivered == GROUPS * DATA && !RtpvGetRecoveryDeadlineUs(&queue));
+                CHECK(repaired == (delays[t] < windows[w] ? 0 : 1));
+                RtpvExpireRecoveryDeadline(&queue, nowUs + 100000);
+                CHECK(delivered == GROUPS * DATA);
+                calls += rsCalls - before;
+                RtpvCleanupQueue(&queue);
+            }
+            printf("fps=%u%s window=%uus recovered_frames=6/6 mean_delivery=%uus late_originals=%u final_block_RS=%u\n",
+                   rates[r], r == 4 ? " VFR" : "", windows[w], sumUs/6, caught, calls);
+        }
+    }
+}
+
+static void checkBoundary(void) {
+    RTP_VIDEO_QUEUE queue;
+    RtpvInitializeQueue(&queue);
+    prepare(1, 0);
+    staticDesktop(&queue, 0);
+    CHECK(!RtpvGetRecoveryDeadlineUs(&queue));
+    RtpvExpireRecoveryDeadline(&queue, nowUs + 100000);
+    CHECK(!delivered);
+    sendShard(&queue, 3, DATA, true, 7);
+#ifdef FEC_VALIDATION_MODE
+    CHECK(!RtpvGetRecoveryDeadlineUs(&queue));
+    sendShard(&queue, 3, DATA + 1, true, 7);
+#endif
+    CHECK(RtpvGetRecoveryDeadlineUs(&queue));
+    sendShardNumber(&queue, 0, 0, true, 0, 2);
+    CHECK(delivered == GROUPS * DATA && repaired == 1);
+    RtpvCleanupQueue(&queue);
 }
 
 int main(void) {
@@ -125,6 +120,8 @@ int main(void) {
     prepare(7, first + GROUPS * TOTAL);
     sendShard(&queue, 3, 5, true, 0); // Stop with a later group outstanding.
     RtpvCleanupQueue(&queue);
+    compareWindows();
+    checkBoundary();
     cleanupPlatform();
     printf("ready packet: sequential %u, interleaved %u of %u; recovered 24 originals\n",
            sequential, interleaved, GROUPS * TOTAL);

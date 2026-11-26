@@ -221,21 +221,30 @@ static int receiveDatagram(SOCKET s, char* buffer, int size, uint64_t* kernelUs)
 }
 
 int recvUdpSocket(SOCKET s, char* buffer, int size, bool useSelect) {
-    return recvUdpSocketTimed(s, buffer, size, useSelect, NULL);
+    return recvUdpSocketTimed(s, buffer, size, useSelect, 0, NULL);
 }
 
-int recvUdpSocketTimed(SOCKET s, char* buffer, int size, bool useSelect, uint64_t* kernelUs) {
+int recvUdpSocketTimed(SOCKET s, char* buffer, int size, bool useSelect, uint64_t deadlineUs, uint64_t* kernelUs) {
     if (kernelUs) *kernelUs = 0;
     int err;
 
     do {
-        if (useSelect) {
+        if (useSelect || deadlineUs) {
+            int timeoutMs = UDP_RECV_POLL_TIMEOUT_MS;
+            if (deadlineUs) {
+                // Recompute after endpoint maintenance and ignored ICMP errors.
+                uint64_t nowUs = PltGetMicroseconds();
+                if (nowUs >= deadlineUs) return 0;
+                uint64_t remainingUs = deadlineUs - nowUs;
+                if (remainingUs < (uint64_t)timeoutMs * 1000) {
+                    timeoutMs = (int)((remainingUs + 999) / 1000);
+                }
+            }
             struct pollfd pfd;
 
-            // Wait up to 100 ms for the socket to be readable
             pfd.fd = s;
             pfd.events = POLLIN;
-            err = pollSockets(&pfd, 1, UDP_RECV_POLL_TIMEOUT_MS);
+            err = pollSockets(&pfd, 1, timeoutMs);
             if (err <= 0) {
                 // Return if an error or timeout occurs
                 return err;
