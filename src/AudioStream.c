@@ -115,7 +115,8 @@ void queueMatBackgroundControl(const MAT_BACKGROUND* m) {
         return;
     }
     PltLockMutex(&matRecoveryMutex);
-    if (matBgAwait && m->serial == matBgRequest.serial && m->sessionEpoch == matBgRequest.sessionEpoch &&
+    if ((matBgAwait || (matBgWaitingPrepare && m->verb == MAT_BG_BLOCKED)) &&
+        m->serial == matBgRequest.serial && m->sessionEpoch == matBgRequest.sessionEpoch &&
         m->generation >= matBgRequest.generation &&
         ((m->verb == MAT_BG_SUSPENDED && matBgRequest.verb == MAT_BG_SUSPEND) ||
          (m->verb == MAT_BG_RESUMING && matBgRequest.verb == MAT_BG_RESUME) || m->verb == MAT_BG_BLOCKED)) {
