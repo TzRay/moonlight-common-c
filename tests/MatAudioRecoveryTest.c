@@ -13,7 +13,22 @@ int testSendBackgroundControl(const MAT_BACKGROUND*);
 #define sendMatBackgroundControl testSendBackgroundControl
 #define bindUdpSocket testBindUdpSocket
 #define sendMatAudioRecoveryControl testSendRecoveryControl
+static void testRecoverySleep(PLT_THREAD* thread, int ms);
+static void testRecoveryWait(PLT_EVENT* event);
+#define PltSleepMsInterruptible testRecoverySleep
+#define PltWaitForEvent testRecoveryWait
 #include "../src/AudioStream.c"
+#undef PltSleepMsInterruptible
+#undef PltWaitForEvent
+static atomic_uint recoveryTimers, recoveryWaits;
+static void testRecoverySleep(PLT_THREAD* thread, int ms) {
+    if (thread == &matRecoveryThread && ms == 50) atomic_fetch_add(&recoveryTimers, 1);
+    PltSleepMsInterruptible(thread, ms);
+}
+static void testRecoveryWait(PLT_EVENT* event) {
+    if (event == &matRecoveryEvent) atomic_fetch_add(&recoveryWaits, 1);
+    PltWaitForEvent(event);
+}
 #undef bindUdpSocket
 #include "MatLiveCrypto.h"
 #include <stdio.h>
@@ -349,6 +364,20 @@ static void failedV2CannotRevive(void) {
     uint64_t began=PltGetMillis();teardown();CHECK(PltGetMillis()-began<2000);
     int inits=atomic_load(&initialized);queueMatAudioRecoveryControl(&conflict);PltSleepMs(20);CHECK(atomic_load(&initialized)==inits);
 }
+static void initialNotificationCost(void) {
+    eventRenderer = true;
+    atomic_store(&recoveryTimers, 0);
+    atomic_store(&recoveryWaits, 0);
+    setup(false);
+    PltSleepMs(350);
+    unsigned timers = atomic_load(&recoveryTimers), waits = atomic_load(&recoveryWaits);
+    printf("initial renderer 350ms recovery timers=%u event waits=%u\n", timers, waits);
+    CHECK(!timers && waits == 1);
+    LiNotifyMatPlaybackFailure(123, 7);
+    CHECK(awaitCount(&requestCount, 1));
+    teardown();
+    eventRenderer = false;
+}
 static void stableNotificationCost(bool enabled) {
     eventRenderer = enabled;
     setup(false);
@@ -551,6 +580,7 @@ int main(void) {
     setup(true);CHECK(requestMatAudioRecovery(1));CHECK(awaitCount(&terminated,1));teardown();
     repeatedV2WithOldPort();
     failedV2CannotRevive();
+    initialNotificationCost();
     stableNotificationCost(false);
     stableNotificationCost(true);
     peerFailureHasNoEcho(false);
