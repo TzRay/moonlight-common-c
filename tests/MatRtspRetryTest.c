@@ -100,12 +100,12 @@ static void run(const char* name, int codec, int busyResponses, int finalStatus,
     peer.stop = true;
     PltJoinThread(&thread);
     closeSocket(peer.listener);
+    printf("%s: result=%d describes=%d elapsed=%llu ms\n", name, result,
+           peer.describes, (unsigned long long)elapsed);
     CHECK(result == expectedResult);
     CHECK(peer.describes >= minRequests && peer.describes <= maxRequests);
     if (busyResponses == 100 || (finalStatus == 0 && !cancel)) CHECK(elapsed >= 14950 && elapsed < 15400);
     else CHECK(elapsed < 2000);
-    printf("PASS %s: result=%d describes=%d elapsed=%llu ms\n", name, result,
-           peer.describes, (unsigned long long)elapsed);
 }
 
 int main(void) {
