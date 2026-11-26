@@ -28,7 +28,7 @@ static void liveCallbacks(void) {
     MAT_LIVE_CIPHER cipher;
     LI_MAT_LIVE_PROFILE profile={1,1};
     CHECK(MatLiveCipherInit(&cipher,key,sizeof(key),1,1));
-    LI_MAT_PLAYBACK_CALLBACKS callbacks={consumeCycle,consumeEnd,NULL,NULL,NULL};
+    LI_MAT_PLAYBACK_CALLBACKS callbacks = { .cycle = consumeCycle, .end = consumeEnd };
     LiSetMatPlaybackCallbacksEx(&callbacks, sizeof(callbacks)); snapshotMatCallbacks();ListenerCallbacks.connectionTerminated=terminate;
     registerLegacyMatClient(&received);
     CHECK(matCallbacks.context == NULL && matCallbacks.cycle == consumeCycle);
