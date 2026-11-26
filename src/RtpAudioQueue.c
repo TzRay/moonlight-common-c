@@ -525,6 +525,16 @@ static bool queueHasPacketReady(PRTP_AUDIO_QUEUE queue) {
             || queue->blockHead->allowDiscontinuity);
 }
 
+static uint64_t blockWaitTimeUs(PRTPA_FEC_BLOCK block) {
+    uint64_t now = PltGetMicroseconds();
+    // A platform using its wall clock may step backwards while FEC is waiting.
+    // Start a fresh grace period so a large correction cannot stall the queue.
+    if (now < block->queueTimeUs) {
+        block->queueTimeUs = now;
+    }
+    return now - block->queueTimeUs;
+}
+
 static void handleMissingPackets(PRTP_AUDIO_QUEUE queue) {
     // Nothing to do for an empty queue
     if (queue->blockHead == NULL) {
@@ -549,7 +559,7 @@ static void handleMissingPackets(PRTP_AUDIO_QUEUE queue) {
         // A whole MAT block can be reordered too. Keep the same bounded wait as
         // a partial block before skipping data that the carrier cannot conceal.
         if (isMat) {
-            uint64_t waitUs = PltGetMicroseconds() - queue->blockHead->queueTimeUs;
+            uint64_t waitUs = blockWaitTimeUs(queue->blockHead);
             if (waitUs <= reorderWaitUs) {
                 return;
             }
@@ -578,7 +588,7 @@ static void handleMissingPackets(PRTP_AUDIO_QUEUE queue) {
     // MAT cannot conceal a skipped packet. Give even the first gap the bounded
     // recovery window so a late data/parity packet can preserve the carrier.
     if ((!isMat && !queue->receivedOosData) ||
-        PltGetMicroseconds() - queue->blockHead->queueTimeUs > reorderWaitUs) {
+        blockWaitTimeUs(queue->blockHead) > reorderWaitUs) {
         LC_ASSERT(!isBefore16(queue->nextRtpSequenceNumber, queue->blockHead->fecHeader.baseSequenceNumber));
 
         queue->stats.packetCountFecFailed++;

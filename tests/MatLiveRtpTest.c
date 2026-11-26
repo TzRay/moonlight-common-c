@@ -242,6 +242,24 @@ static void olderBlockBeforeExpiry(void) {
     CHECK(rtpAudioQueue.stats.packetCountFecFailed == 1);
     closeSession();
 }
+
+static void reorderedBlockAfterClockRollback(bool wholeBlock) {
+    uint8_t carrier[MAT_WIRE_CYCLE];
+    TEST_BLOCK first, next;
+    beginSession();
+    makeCarrier(carrier, 0);
+    dataBlock(&first, carrier, 0, 0);
+    dataBlock(&next, carrier, 0, 4);
+    if (!wholeBlock) packet(first.base, first.shards[0], MAT_LIVE_PACKET);
+    packet(next.base, next.shards[0], MAT_LIVE_PACKET);
+    queueClockUs -= 50000;
+    packet(next.base + 1, next.shards[1], MAT_LIVE_PACKET);
+    CHECK(!terminated && rtpAudioQueue.stats.packetCountFecFailed == 0);
+    queueClockUs += 14001;
+    packet(next.base + 2, next.shards[2], MAT_LIVE_PACKET);
+    CHECK(terminated == 1 && rtpAudioQueue.stats.packetCountFecFailed == 1);
+    closeSession();
+}
 #endif
 
 static void permanentLoss(bool wholeBlock) {
@@ -344,6 +362,8 @@ int main(void) {
 #ifndef LC_AUDIO_FEC_VALIDATION
     arrivalWindows();
     olderBlockBeforeExpiry();
+    reorderedBlockAfterClockRollback(false);
+    reorderedBlockAfterClockRollback(true);
     fecRoundTrip(3, false, false); fecRoundTrip(3, true, false);
     fecRoundTrip(1u | (1u << 4), true, false); fecRoundTrip(3, true, true);
     for (int whole = 0; whole <= 1; ++whole) {
