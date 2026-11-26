@@ -207,7 +207,10 @@ static int receiveDatagram(SOCKET s, char* buffer, int size, uint64_t* kernelUs)
                     c->cmsg_len == CMSG_LEN(sizeof(struct timespec))) {
                     struct timespec t;
                     memcpy(&t, CMSG_DATA(c), sizeof(t));
-                    *kernelUs = (uint64_t)t.tv_sec * 1000000 + t.tv_nsec / 1000;
+                    if (t.tv_sec >= 0 && t.tv_nsec >= 0 && t.tv_nsec < 1000000000L &&
+                        (uint64_t)t.tv_sec <= (UINT64_MAX - (uint64_t)t.tv_nsec / 1000) / 1000000) {
+                        *kernelUs = (uint64_t)t.tv_sec * 1000000 + (uint64_t)t.tv_nsec / 1000;
+                    }
                     break;
                 }
             }
