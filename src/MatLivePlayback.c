@@ -23,7 +23,10 @@ MAT_LIVE_PLAYBACK* MatLivePlaybackOpen(const LI_MAT_LIVE_PROFILE* p,const uint8_
     if(!MatLiveCipherInit(&s->cipher,key,16,p->epoch,p->domain)||!MatLiveContextInit(&s->decryptor,&s->cipher,0)){
         MatLiveContextDestroy(&s->decryptor);MatLiveWipe(s,sizeof(*s));free(s);return NULL;
     }
-    s->callbacks=*callbacks;s->nextPacket=4; /* four authenticated transport SYNC packets precede RTP data */
+    s->callbacks.cycle = callbacks->cycle;
+    s->callbacks.end = callbacks->end;
+    s->callbacks.context = callbacks->context;
+    s->nextPacket=4; /* four authenticated transport SYNC packets precede RTP data */
     MatReceiverInit(&s->receiver,cycle,end,s);return s;
 }
 int MatLivePlaybackPush(MAT_LIVE_PLAYBACK* s,const uint8_t* wire,size_t length) {

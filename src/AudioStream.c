@@ -7,9 +7,16 @@ static atomic_bool matInputEnded;
 static atomic_ullong matLastAcceptedMs;
 static MAT_LIVE_PLAYBACK* matLive;
 static LI_MAT_PLAYBACK_CALLBACKS matCallbacks, registeredMatCallbacks;
+static uint64_t notificationEpoch, notificationDomain;
 static atomic_flag matCallbackLock = ATOMIC_FLAG_INIT;
 static void lockMatCallbacks(void) {
     while (atomic_flag_test_and_set_explicit(&matCallbackLock, memory_order_acquire)) {}
+}
+static void setMatNotificationIdentity(uint64_t epoch, uint64_t domain) {
+    lockMatCallbacks();
+    notificationEpoch = epoch;
+    notificationDomain = domain;
+    atomic_flag_clear_explicit(&matCallbackLock, memory_order_release);
 }
 static void snapshotMatCallbacks(void) {
     lockMatCallbacks();
@@ -55,9 +62,35 @@ static void MatRecoveryV2ThreadProc(void);
 static bool requestMatRecoveryV2(uint32_t reason);
 static void queueMatRecoveryV2(const MAT_AUDIO_RECOVERY* m);
 
+// matCallbackLock pins the current event/mutex until the notification returns.
+static void notifyMatFailureLocked(void) {
+    PltLockMutex(&matRecoveryMutex);
+    if (matV2Phase == MAT_V2_RUNNING ||
+        (matV2Profile.newEpoch == notificationEpoch && matV2Phase != MAT_V2_FAILED)) {
+        matV2Phase = matV2Profile.generation ? MAT_V2_FAILED : MAT_V2_REQUESTED;
+        matV2Report = true;
+    }
+    else if (matV2Phase == MAT_V2_FAILED && atomic_load(&matRecoveryBlocked) &&
+             matV2PeerFailure != MAT_RECOVERY_BLOCKED && matV2SentFailure != MAT_RECOVERY_BLOCKED) {
+        matV2Report = true;
+    }
+    PltSetEvent(&matRecoveryEvent);
+    PltUnlockMutex(&matRecoveryMutex);
+}
+
 void LiBlockMatAudioRecovery(void) {
     // Cleared only by initializeAudioStream(), never by a generation rebuild.
     atomic_store(&matRecoveryBlocked, true);
+    lockMatCallbacks();
+    if (notificationEpoch) notifyMatFailureLocked();
+    atomic_flag_clear_explicit(&matCallbackLock, memory_order_release);
+}
+
+void LiNotifyMatPlaybackFailure(uint64_t epoch, uint64_t domain) {
+    // Clearing the identity waits for an in-flight notification before teardown.
+    lockMatCallbacks();
+    if (epoch && epoch == notificationEpoch && domain == notificationDomain) notifyMatFailureLocked();
+    atomic_flag_clear_explicit(&matCallbackLock, memory_order_release);
 }
 
 static bool matV2AcceptRtp(const uint8_t* bytes, size_t length) {
@@ -184,6 +217,8 @@ void LiSetMatPlaybackCallbacksEx(const LI_MAT_PLAYBACK_CALLBACKS* callbacks, siz
             next.threadStart = callbacks->threadStart;
         if (size >= offsetof(LI_MAT_PLAYBACK_CALLBACKS, progress) + sizeof(next.progress))
             next.progress = callbacks->progress;
+        if (size >= offsetof(LI_MAT_PLAYBACK_CALLBACKS, reportsFailures) + sizeof(next.reportsFailures))
+            next.reportsFailures = callbacks->reportsFailures;
     }
     lockMatCallbacks();
     registeredMatCallbacks = next;
@@ -478,6 +513,7 @@ static void freePacketList(PLINKED_BLOCKING_QUEUE_ENTRY entry) {
 
 // Tear down the audio stream once we're done with it
 void destroyAudioStream(void) {
+    setMatNotificationIdentity(0, 0);
     atomic_store(&matRecoveryAccepting, false);
     destroyAudioGeneration();
     PltCloseEvent(&matRecoveryEvent);
@@ -851,6 +887,7 @@ void stopAudioStream(void) {
 }
 
 static void stopAudioGeneration(void) {
+    setMatNotificationIdentity(0, 0);
     atomic_store(&matGenerationStopping, true);
     if (!receivedDataFromPeer) {
         Limelog("No audio traffic was ever received from the host!\n");
@@ -966,6 +1003,8 @@ static int prepareAudioGeneration(void* audioContext, int arFlags) {
     if(NegotiatedAudioCodec==AUDIO_CODEC_MAT_LIVE) {
         matLive=MatLivePlaybackOpen(&MatLiveProfile,(const uint8_t*)StreamConfig.remoteInputAesKey,&callbacks);
         if(!matLive){AudioCallbacks.cleanup();audioPrepared=false;return -1;}
+        if (NegotiatedMatAudioRecovery == 2 && matCallbacks.reportsFailures)
+            setMatNotificationIdentity(MatLiveProfile.epoch, MatLiveProfile.domain);
     }
     return 0;
 }
@@ -1157,6 +1196,7 @@ static void MatRecoveryV2ThreadProc(void) {
         MAT_AUDIO_RECOVERY message = matV2Profile;
         uint64_t deadline = matV2Deadline;
         bool report = matV2Report, resend = matV2ResendReady;
+        bool stableNotifications = matV2StableSent && matCallbacks.reportsFailures;
         matV2Report = matV2ResendReady = false;
         PltUnlockMutex(&matRecoveryMutex);
 
@@ -1255,20 +1295,33 @@ static void MatRecoveryV2ThreadProc(void) {
         }
         else if (phase == MAT_V2_CONFIRMING || phase == MAT_V2_PLAYING) {
             if (resend && !matV2Send(&message, MAT_RECOVERY_READY)) return;
-            int progress = matCallbacks.progress ? matCallbacks.progress(matCallbacks.context, message.newEpoch, message.domain) : -1;
-            if (atomic_load(&matRecoveryBlocked) || progress < 0) { matV2Fail(message.generation); continue; }
-            PltLockMutex(&matRecoveryMutex);
-            bool current = matV2Profile.generation == message.generation &&
-                (matV2Phase == MAT_V2_CONFIRMING || matV2Phase == MAT_V2_PLAYING);
-            bool timedOut = current && matV2Phase == MAT_V2_CONFIRMING && PltGetMillis() >= matV2Deadline;
-            bool playing = current && !timedOut && (progress & 1) && !matV2PlayingSent;
-            bool stable = current && !timedOut && (progress & 3) == 3 && !matV2StableSent;
-            if (playing) { matV2PlayingSent = true; matV2Phase = MAT_V2_PLAYING; }
-            if (stable) matV2StableSent = true;
-            PltUnlockMutex(&matRecoveryMutex);
-            if (playing && !matV2Send(&message, MAT_RECOVERY_PLAYING)) return;
-            if (stable && !matV2Send(&message, MAT_RECOVERY_STABLE)) return;
-            if (timedOut) matV2Fail(message.generation);
+            if (!stableNotifications) {
+                int progress = matCallbacks.progress ? matCallbacks.progress(matCallbacks.context, message.newEpoch, message.domain) : -1;
+                if (atomic_load(&matRecoveryBlocked) || progress < 0) { matV2Fail(message.generation); continue; }
+                PltLockMutex(&matRecoveryMutex);
+                bool current = matV2Profile.generation == message.generation &&
+                    (matV2Phase == MAT_V2_CONFIRMING || matV2Phase == MAT_V2_PLAYING);
+                bool timedOut = current && matV2Phase == MAT_V2_CONFIRMING && PltGetMillis() >= matV2Deadline;
+                bool playing = current && !timedOut && (progress & 1) && !matV2PlayingSent;
+                bool stable = current && !timedOut && (progress & 3) == 3 && !matV2StableSent;
+                if (playing) { matV2PlayingSent = true; matV2Phase = MAT_V2_PLAYING; }
+                if (stable) matV2StableSent = true;
+                PltUnlockMutex(&matRecoveryMutex);
+                if (playing && !matV2Send(&message, MAT_RECOVERY_PLAYING)) return;
+                if (stable && !matV2Send(&message, MAT_RECOVERY_STABLE)) return;
+                if (timedOut) matV2Fail(message.generation);
+            }
+        }
+        PltLockMutex(&matRecoveryMutex);
+        bool sleepUntilEvent = matV2Phase == MAT_V2_PLAYING && matV2StableSent &&
+                               matCallbacks.reportsFailures && !matV2ResendReady;
+        // Clear only while the phase is still stable. A producer changing the
+        // phase or queuing another PREPARE then signals after acquiring this mutex.
+        if (sleepUntilEvent) PltClearEvent(&matRecoveryEvent);
+        PltUnlockMutex(&matRecoveryMutex);
+        if (sleepUntilEvent) {
+            if (!recoveryCancelled()) PltWaitForEvent(&matRecoveryEvent);
+            continue;
         }
         PltSleepMsInterruptible(&matRecoveryThread, phase == MAT_V2_PENDING || phase == MAT_V2_READY ? 10 : 50);
     }
