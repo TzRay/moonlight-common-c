@@ -373,14 +373,27 @@ int initializeAudioStream(void) {
     atomic_store(&matRecoveryBlocked, false);
     memset(&matReceiveDiagnostics, 0, sizeof(matReceiveDiagnostics));
     memset(&matDecodeDiagnostics, 0, sizeof(matDecodeDiagnostics));
-    return initializeAudioGeneration();
+    err = initializeAudioGeneration();
+    if (err != 0) {
+        PltCloseEvent(&matRecoveryEvent);
+        PltDeleteMutex(&matRecoveryMutex);
+    }
+    return err;
 }
 
 static int initializeAudioGeneration(void) {
     // RTSP can still select Opus for a MAT preference. Final receive parameters
     // are set in startAudioStream(), before either queue worker starts.
-    LbqInitializeLinkedBlockingQueue(&packetQueue, 30);
-    RtpaInitializeQueue(&rtpAudioQueue);
+    int err = LbqInitializeLinkedBlockingQueue(&packetQueue, 30);
+    if (err != 0) return err;
+    if (RtpaInitializeQueue(&rtpAudioQueue)) {
+        audioDecryptionCtx = PltCreateCryptoContext();
+        if (!audioDecryptionCtx) RtpaCleanupQueue(&rtpAudioQueue);
+    }
+    if (!audioDecryptionCtx) {
+        LbqDestroyLinkedBlockingQueue(&packetQueue);
+        return -1;
+    }
     lastSeq = 0;
     matPlaybackCompleteReported=false;
     atomic_store_explicit(&matFailureReported,false,memory_order_relaxed);
@@ -396,7 +409,6 @@ static int initializeAudioGeneration(void) {
     receivedDataFromPeer = false;
     pingThreadStarted = false;
     firstReceiveTime = 0;
-    audioDecryptionCtx = PltCreateCryptoContext();
 #ifdef LC_DEBUG
     opusHeaderByte = INVALID_OPUS_HEADER;
 #endif
@@ -486,15 +498,17 @@ static void destroyAudioGeneration(void) {
     }
 
     LiErClientDestroy(&endpointRefresh);
-    PltDestroyCryptoContext(audioDecryptionCtx);
-    audioDecryptionCtx = NULL;
-    freePacketList(LbqDestroyLinkedBlockingQueue(&packetQueue));
+    if (audioDecryptionCtx) {
+        PltDestroyCryptoContext(audioDecryptionCtx);
+        audioDecryptionCtx = NULL;
+        freePacketList(LbqDestroyLinkedBlockingQueue(&packetQueue));
+        RtpaCleanupQueue(&rtpAudioQueue);
+    }
     if (matPoolReady) {
         LbqSignalQueueShutdown(&matFreePackets);
         freePacketList(LbqDestroyLinkedBlockingQueue(&matFreePackets));
         matPoolReady = false;
     }
-    RtpaCleanupQueue(&rtpAudioQueue);
 }
 
 static bool queuePacketToLbq(PQUEUED_AUDIO_PACKET* packet) {
@@ -862,7 +876,7 @@ static void stopAudioGeneration(void) {
         pingThreadStarted = false;
     }
     // A partially prepared generation can have queued packets but no decoder.
-    LbqSignalQueueShutdown(&packetQueue);
+    if (audioDecryptionCtx) LbqSignalQueueShutdown(&packetQueue);
 
     if (AUDIO_CODEC_IS_MAT(NegotiatedAudioCodec)) {
         uint64_t now = PltGetMicroseconds();
@@ -1188,7 +1202,11 @@ static void MatRecoveryV2ThreadProc(void) {
                 closeSocket(nextSocket); matV2Fail(message.generation); continue;
             }
             destroyAudioGeneration();
-            initializeAudioGeneration();
+            if (initializeAudioGeneration() != 0) {
+                closeSocket(nextSocket);
+                matV2Fail(message.generation);
+                continue;
+            }
             stopped = false;
             rtpSocket = nextSocket;
             LiRecordStreamSocket(rtpSocket, STREAM_SOCKET_SLOT_AUDIO);
@@ -1304,7 +1322,7 @@ static void MatRecoveryThreadProc(void* context) {
         if (!message.clientPort || message.clientPort == audioSocketPort(rtpSocket)) goto failure;
         stopAudioGeneration();
         destroyAudioGeneration();
-        initializeAudioGeneration();
+        if (initializeAudioGeneration() != 0) goto failure;
         rtpSocket = nextSocket;
         nextSocket = INVALID_SOCKET;
         if (recoveryCancelled()) goto failure;
