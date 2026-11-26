@@ -1451,8 +1451,11 @@ static void MatRecoveryV2ThreadProc(void) {
             }
         }
         PltLockMutex(&matRecoveryMutex);
-        bool sleepUntilEvent = matV2.phase == MAT_V2_PLAYING && matV2.stableSent &&
-                               matCallbacks.reportsFailures && !matV2.resendReady;
+        // The initial generation has no confirmation deadline. Its media and
+        // control failures change the phase and signal this event.
+        bool sleepUntilEvent = matV2.phase == MAT_V2_RUNNING ||
+                               (matV2.phase == MAT_V2_PLAYING && matV2.stableSent &&
+                                matCallbacks.reportsFailures && !matV2.resendReady);
         sleepUntilEvent |= matV2.phase == MAT_V2_BACKGROUND && matBackground.suspended && !matBackground.awaitingReply && stopped;
         // Clear only while the phase is still stable. A producer changing the
         // phase or queuing another PREPARE then signals after acquiring this mutex.
