@@ -167,6 +167,7 @@ extern bool VideoFecControlSupported;
 extern bool VideoFecInterleavingEnabled;
 void connectionRecordVideoCoverageGaps(uint32_t gaps);
 void connectionRecordFecBlock(uint16_t data, uint16_t received);
+void connectionTakeFecSummary(SS_FEC_SUMMARY* summary);
 int sendInputPacketOnControlStream(unsigned char* data, int length, uint8_t channelId, uint32_t flags, bool moreData);
 int sendMatAudioRecoveryControl(const MAT_AUDIO_RECOVERY* recovery);
 void queueMatAudioRecoveryControl(const MAT_AUDIO_RECOVERY* recovery);

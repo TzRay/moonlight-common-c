@@ -190,7 +190,7 @@ bool enableUdpReceiveTimestamps(SOCKET s) {
 #endif
 }
 
-static int receiveDatagram(SOCKET s, char* buffer, int size, uint64_t* kernelUs) {
+static int receiveDatagram(SOCKET s, char* buffer, int size, int flags, uint64_t* kernelUs) {
 #if defined(__ANDROID__) && defined(SO_TIMESTAMPNS)
     if (kernelUs) {
         union { struct cmsghdr align; char bytes[CMSG_SPACE(sizeof(struct timespec))]; } control;
@@ -200,7 +200,7 @@ static int receiveDatagram(SOCKET s, char* buffer, int size, uint64_t* kernelUs)
         msg.msg_iovlen = 1;
         msg.msg_control = control.bytes;
         msg.msg_controllen = sizeof(control.bytes);
-        int n = (int)recvmsg(s, &msg, 0);
+        int n = (int)recvmsg(s, &msg, flags);
         if (n > 0 && !(msg.msg_flags & MSG_CTRUNC)) {
             for (struct cmsghdr* c = CMSG_FIRSTHDR(&msg); c; c = CMSG_NXTHDR(&msg, c)) {
                 if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SO_TIMESTAMPNS &&
@@ -217,7 +217,7 @@ static int receiveDatagram(SOCKET s, char* buffer, int size, uint64_t* kernelUs)
 #else
     (void)kernelUs;
 #endif
-    return (int)recvfrom(s, buffer, size, 0, NULL, NULL);
+    return (int)recvfrom(s, buffer, size, flags, NULL, NULL);
 }
 
 int recvUdpSocket(SOCKET s, char* buffer, int size, bool useSelect) {
@@ -245,31 +245,28 @@ int recvUdpSocketTimed(SOCKET s, char* buffer, int size, bool useSelect, uint64_
             pfd.fd = s;
             pfd.events = POLLIN;
             err = pollSockets(&pfd, 1, timeoutMs);
-            if (err <= 0) {
-                // Return if an error or timeout occurs
-                return err;
+            if (err == 0) return 0;
+            if (err > 0) {
+                // Readiness can disappear between poll and recvmsg (e.g. a
+                // datagram discarded by the kernel). Keep the FEC deadline.
+#ifdef MSG_DONTWAIT
+                err = receiveDatagram(s, buffer, size, MSG_DONTWAIT, kernelUs);
+#else
+                err = receiveDatagram(s, buffer, size, 0, kernelUs);
+#endif
             }
-
-            // This won't block since the socket is readable
-            err = receiveDatagram(s, buffer, size, kernelUs);
         }
         else {
-            // The caller has already configured a timeout on this
-            // socket via SO_RCVTIMEO, so we can avoid a syscall
-            // for each packet.
-            err = receiveDatagram(s, buffer, size, kernelUs);
-            if (err < 0 &&
-                    (LastSocketError() == EWOULDBLOCK ||
-                     LastSocketError() == EINTR ||
-                     LastSocketError() == EAGAIN ||
-         #if defined(LC_WINDOWS) && !defined(NXDK)
-                     // This error is specific to overlapped I/O which isn't even
-                     // possible to perform with recvfrom(). It seems to randomly
-                     // be returned instead of WSAETIMEDOUT on certain systems.
-                     LastSocketError() == WSA_IO_PENDING ||
-         #endif
-                     LastSocketError() == ETIMEDOUT)) {
-                // Return 0 for timeout
+            err = receiveDatagram(s, buffer, size, 0, kernelUs);
+        }
+
+        if (err < 0) {
+            int error = LastSocketError();
+            if (error == EINTR || error == EAGAIN || error == EWOULDBLOCK ||
+#if defined(LC_WINDOWS) && !defined(NXDK)
+                error == WSA_IO_PENDING ||
+#endif
+                error == ETIMEDOUT) {
                 return 0;
             }
         }

@@ -44,7 +44,10 @@ void captureLoss(unsigned frame, bool speculative) { (void)frame; (void)speculat
 void ignoreFrame(uint32_t frame) { (void)frame; }
 void ignoreStatus(PSS_FRAME_FEC_STATUS status) { (void)status; recoveryReports++; }
 bool allowRfi(void) { return true; }
+#undef connectionRecordFecBlock
+void connectionRecordFecBlock(uint16_t data, uint16_t received);
 void captureStats(uint16_t data, uint16_t received) {
+    connectionRecordFecBlock(data, received);
     repaired += data - received;
 }
 
