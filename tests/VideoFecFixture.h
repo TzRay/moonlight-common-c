@@ -114,4 +114,3 @@ static void staticDesktop(PRTP_VIDEO_QUEUE queue, unsigned parity) {
     for (unsigned i = 0; i < parity; i++) sendShard(queue, GROUPS - 1, DATA + i, true, 7);
     for (unsigned i = DATA / 2; i < DATA - 1; i++) sendShard(queue, GROUPS - 1, i, true, 7);
 }
-
