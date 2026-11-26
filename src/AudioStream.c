@@ -6,7 +6,16 @@
 static atomic_bool matInputEnded;
 static atomic_ullong matLastAcceptedMs;
 static MAT_LIVE_PLAYBACK* matLive;
-static LI_MAT_PLAYBACK_CALLBACKS matCallbacks;
+static LI_MAT_PLAYBACK_CALLBACKS matCallbacks, registeredMatCallbacks;
+static atomic_flag matCallbackLock = ATOMIC_FLAG_INIT;
+static void lockMatCallbacks(void) {
+    while (atomic_flag_test_and_set_explicit(&matCallbackLock, memory_order_acquire)) {}
+}
+static void snapshotMatCallbacks(void) {
+    lockMatCallbacks();
+    matCallbacks = registeredMatCallbacks;
+    atomic_flag_clear_explicit(&matCallbackLock, memory_order_release);
+}
 static bool matPlaybackCompleteReported;
 static atomic_bool matFailureReported;
 static atomic_uint matPendingPackets;
@@ -165,7 +174,21 @@ static void startMatAudioWorker(int role) {
     }
 }
 void LiSetMatPlaybackCallbacks(const LI_MAT_PLAYBACK_CALLBACKS* callbacks) {
-    if(callbacks) matCallbacks=*callbacks; else memset(&matCallbacks,0,sizeof(matCallbacks));
+void LiSetMatPlaybackCallbacksEx(const LI_MAT_PLAYBACK_CALLBACKS* callbacks, size_t size) {
+    LI_MAT_PLAYBACK_CALLBACKS next = {0};
+    const size_t prefix = offsetof(LI_MAT_PLAYBACK_CALLBACKS, threadStart);
+    if (callbacks && size >= prefix) {
+        memcpy(&next, callbacks, prefix);
+        if (size >= offsetof(LI_MAT_PLAYBACK_CALLBACKS, threadStart) + sizeof(next.threadStart))
+            next.threadStart = callbacks->threadStart;
+        if (size >= offsetof(LI_MAT_PLAYBACK_CALLBACKS, progress) + sizeof(next.progress))
+            next.progress = callbacks->progress;
+    }
+    lockMatCallbacks();
+    registeredMatCallbacks = next;
+    atomic_flag_clear_explicit(&matCallbackLock, memory_order_release);
+}
+    LiSetMatPlaybackCallbacksEx(callbacks, offsetof(LI_MAT_PLAYBACK_CALLBACKS, threadStart));
 }
 static int matEnd(void* context,uint64_t cycles) {
     // A verified END may take time to drain the hardware. Stop the network
@@ -907,6 +930,16 @@ static int prepareAudioGeneration(void* audioContext, int arFlags) {
 
     LI_MAT_PLAYBACK_CALLBACKS callbacks=matCallbacks;callbacks.end=matCallbacks.end?matEnd:NULL;
     if (callbacks.cycle) callbacks.cycle = timedMatCycle;
+    if (AUDIO_CODEC_IS_MAT(NegotiatedAudioCodec)) {
+        snapshotMatCallbacks();
+        if (NegotiatedMatAudioRecovery == 2 && !matCallbacks.progress) {
+            Limelog("MAT renderer selected recovery v2 without a playback progress callback\n");
+            LiBlockMatAudioRecovery();
+            AudioCallbacks.cleanup();
+            audioPrepared = false;
+            return -1;
+        }
+    }
     if(AUDIO_CODEC_IS_MAT(NegotiatedAudioCodec)) {
         atomic_store_explicit(&matInputEnded,false,memory_order_relaxed);
         atomic_store_explicit(&matLastAcceptedMs,PltGetMillis(),memory_order_relaxed);

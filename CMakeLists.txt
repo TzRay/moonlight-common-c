@@ -301,7 +301,7 @@ if (BUILD_TESTING)
       endif()
       add_test(NAME mat-fec-validation-tests COMMAND mat-fec-validation-tests)
     endif()
-    add_executable(audio-codec-selection-tests tests/AudioCodecSelectionTest.c)
+    add_executable(audio-codec-selection-tests tests/AudioCodecSelectionTest.c tests/MatPlaybackLegacyAbi.c)
     target_include_directories(audio-codec-selection-tests PRIVATE
       enet/include $<TARGET_PROPERTY:moonlight-common-c,INCLUDE_DIRECTORIES>)
     target_compile_definitions(audio-codec-selection-tests PRIVATE

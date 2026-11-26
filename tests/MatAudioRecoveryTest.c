@@ -59,9 +59,9 @@ static int rendererInit(int configuration,POPUS_MULTISTREAM_CONFIGURATION opus,v
     int count=atomic_fetch_add(&initialized,1)+1;
     if(failNewRenderer&&count==2)return -1;
     LI_MAT_PLAYBACK_CALLBACKS cb={cycle,end,(void*)(uintptr_t)count,NULL,rendererProgress};
-    LiSetMatPlaybackCallbacks(&cb);return 0;
+    LiSetMatPlaybackCallbacksEx(&cb, sizeof(cb));return 0;
 }
-static void rendererCleanup(void){atomic_fetch_add(&cleaned,1);LiSetMatPlaybackCallbacks(NULL);if(blockDuringCleanup)LiBlockMatAudioRecovery();}
+static void rendererCleanup(void){atomic_fetch_add(&cleaned,1);LiSetMatPlaybackCallbacksEx(NULL, 0);if(blockDuringCleanup)LiBlockMatAudioRecovery();}
 static void noOp(void){}
 static void terminate(int error){(void)error;atomic_fetch_add(&terminated,1);}
 static void logger(const char* format,...) {va_list args;va_start(args,format);vfprintf(stderr,format,args);va_end(args);}

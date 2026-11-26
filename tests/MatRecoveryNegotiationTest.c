@@ -179,6 +179,8 @@ int main(void) {
 #ifdef MAT_RECOVERY_LEGACY_CLIENT
     run("legacy client with new host",both,confirmation,true,true,true,1,0,1);
 #else
+    run("renderer without playhead",both,confirmation,true,true,true,1,0,1);
+    AudioCallbacks.capabilities |= CAPABILITY_MAT_PLAYBACK_PROGRESS;
     run("v2 agreement",both,"X-SS-Mat-Live-Recovery: 2\r\nX-SS-Mat-Live-Ssrc: 123456\r\n",true,true,true,2,0,2);
     run("v2 missing confirmation",both,"",true,true,true,2,-1,0);
     run("v2 missing identity",both,"X-SS-Mat-Live-Recovery: 2\r\n",true,true,true,2,-1,0);

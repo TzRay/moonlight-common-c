@@ -119,7 +119,7 @@ static void endBlock(TEST_BLOCK* block, unsigned count, uint32_t hash) {
 static void beginSession(void) {
     uint8_t plain[MAT_WIRE_PACKET], wire[MAT_LIVE_PACKET];
     LI_MAT_PLAYBACK_CALLBACKS cb = {0}; cb.cycle = cycle; cb.end = end;
-    LiSetMatPlaybackCallbacks(&cb);
+    LiSetMatPlaybackCallbacksEx(&cb, sizeof(cb)); snapshotMatCallbacks();
     cb.cycle = timedMatCycle;
     cycles = ends = terminated = concealed = opusPackets = 0;
     atomic_store(&matFailureReported, false); atomic_store(&matSuppressedFailures, 0);
@@ -236,11 +236,11 @@ static void opusRecovery(void) {
 }
 static void workerCallback(void) {
     LI_MAT_PLAYBACK_CALLBACKS cb = {0}; cb.threadStart = workerStart; cb.context = &workerStarts;
-    LiSetMatPlaybackCallbacks(&cb); NegotiatedAudioCodec = AUDIO_CODEC_MAT_LIVE;
+    LiSetMatPlaybackCallbacksEx(&cb, sizeof(cb)); snapshotMatCallbacks(); NegotiatedAudioCodec = AUDIO_CODEC_MAT_LIVE;
     startMatAudioWorker(LI_MAT_THREAD_RECEIVE); startMatAudioWorker(LI_MAT_THREAD_DECODE);
     CHECK(workerStarts == 2); NegotiatedAudioCodec = AUDIO_CODEC_OPUS;
     startMatAudioWorker(LI_MAT_THREAD_RECEIVE); CHECK(workerStarts == 2);
-    LiSetMatPlaybackCallbacks(NULL); NegotiatedAudioCodec = AUDIO_CODEC_MAT_LIVE;
+    LiSetMatPlaybackCallbacksEx(NULL, 0); snapshotMatCallbacks(); NegotiatedAudioCodec = AUDIO_CODEC_MAT_LIVE;
     startMatAudioWorker(LI_MAT_THREAD_DECODE); CHECK(workerStarts == 2);
 }
 static void queueOverflow(void) {

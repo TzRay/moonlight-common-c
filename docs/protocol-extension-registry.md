@@ -197,3 +197,14 @@ breaking the base stream.
 Unknown optional flags and opcodes must be ignored safely. Once an identifier
 is published, its meaning and wire format are immutable; incompatible changes
 require a new identifier or protocol version.
+
+
+## Local MAT audio renderer capability
+
+`AUDIO_RENDERER_CALLBACKS.capabilities` bit 23 (`0x00800000`) declares playback
+progress support before RTSP. A client selects MAT recovery v2 only with this
+bit and the host offer. The bit is local and has no wire representation.
+Register the progress callback with `LiSetMatPlaybackCallbacksEx` during audio
+init. A v2 attempt has one 10-second budget from PREPARE through PLAYING;
+STABLE follows 30 seconds of playback. A peer FAIL ends that attempt. A local
+cleanup failure may upgrade a retryable peer failure to BLOCKED once.
