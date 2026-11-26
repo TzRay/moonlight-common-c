@@ -331,6 +331,9 @@ typedef struct {
     // Current epoch/domain only: bit 0 = advancing playhead, bit 1 = stable
     // playback; negative = renderer failure. Queried by the recovery owner.
     int (*progress)(void*, uint64_t epoch, uint64_t domain);
+    // Set only when the renderer calls LiNotifyMatPlaybackFailure on device
+    // loss, focus loss and unexpected stop. Stable playback can then sleep.
+    bool reportsFailures;
 } LI_MAT_PLAYBACK_CALLBACKS;
 #define LI_MAT_THREAD_RECEIVE 0
 #define LI_MAT_THREAD_DECODE 1
@@ -340,6 +343,8 @@ typedef struct {
 void LiSetMatPlaybackCallbacksEx(const LI_MAT_PLAYBACK_CALLBACKS* callbacks, size_t size);
 void LiSetMatPlaybackCallbacks(const LI_MAT_PLAYBACK_CALLBACKS* callbacks);
 void LiBlockMatAudioRecovery(void);
+// A renderer may call this from any thread. Retired audio identities are ignored.
+void LiNotifyMatPlaybackFailure(uint64_t epoch, uint64_t domain);
 
 // Bitmasks for STREAM_CONFIGURATION.supportedAudioCodecs (and reserved for a
 // future server-side capability advertisement). The set bit indicates that the

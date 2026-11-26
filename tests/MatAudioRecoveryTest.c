@@ -21,7 +21,9 @@ static PLT_MUTEX testMutex;
 static bool failNewRenderer, blockDuringCleanup;
 static unsigned testVersion = 1;
 static atomic_int playingCount, stableCount, failCount, progressValue;
-static atomic_uint forcedPort;
+static atomic_uint forcedPort, progressCalls;
+static atomic_ullong failureReportedAt, rendererStoppedAt;
+static bool eventRenderer;
 static atomic_ullong progressEpoch;
 static MAT_AUDIO_RECOVERY lastFailure;
 static SOCKET testBindUdpSocket(int family, struct sockaddr_storage* addr, SOCKADDR_LEN length, int size, int qos) {
@@ -37,6 +39,7 @@ static SOCKET testBindUdpSocket(int family, struct sockaddr_storage* addr, SOCKA
 }
 static int rendererProgress(void* context, uint64_t epoch, uint64_t domain) {
     (void)context;
+    atomic_fetch_add(&progressCalls, 1);
     return epoch == atomic_load(&progressEpoch) && domain == 7 ? atomic_load(&progressValue) : 0;
 }
 #define CHECK(x) do { if (!(x)) { fprintf(stderr,"line %d: %s\n",__LINE__,#x); atomic_fetch_add(&failures,1); } } while(0)
@@ -58,11 +61,12 @@ static int rendererInit(int configuration,POPUS_MULTISTREAM_CONFIGURATION opus,v
     (void)configuration;(void)opus;CHECK(context==(void*)0x1234&&flags==17);
     int count=atomic_fetch_add(&initialized,1)+1;
     if(failNewRenderer&&count==2)return -1;
-    LI_MAT_PLAYBACK_CALLBACKS cb={cycle,end,(void*)(uintptr_t)count,NULL,rendererProgress};
-    LiSetMatPlaybackCallbacksEx(&cb, sizeof(cb));return 0;
+    LI_MAT_PLAYBACK_CALLBACKS cb={cycle,end,(void*)(uintptr_t)count,NULL,rendererProgress,eventRenderer};
+    LiSetMatPlaybackCallbacksEx(&cb, eventRenderer ? sizeof(cb) : offsetof(LI_MAT_PLAYBACK_CALLBACKS, reportsFailures));return 0;
 }
 static void rendererCleanup(void){atomic_fetch_add(&cleaned,1);LiSetMatPlaybackCallbacksEx(NULL, 0);if(blockDuringCleanup)LiBlockMatAudioRecovery();}
 static void noOp(void){}
+static void rendererStop(void){atomic_store(&rendererStoppedAt, PltGetMillis());}
 static void terminate(int error){(void)error;atomic_fetch_add(&terminated,1);}
 static void logger(const char* format,...) {va_list args;va_start(args,format);vfprintf(stderr,format,args);va_end(args);}
 
@@ -83,6 +87,7 @@ int testSendRecoveryControl(const MAT_AUDIO_RECOVERY* message) {
     else if(message->verb==MAT_RECOVERY_STABLE) atomic_fetch_add(&stableCount,1);
     else if(message->verb==MAT_RECOVERY_FAIL) {
         PltLockMutex(&testMutex);lastFailure=*message;PltUnlockMutex(&testMutex);
+        atomic_store(&failureReportedAt, PltGetMillis());
         atomic_fetch_add(&failCount,1);
     }
     return 0;
@@ -152,7 +157,7 @@ static void setup(bool failRenderer) {
     LiInitializeConnectionCallbacks(&ListenerCallbacks);ListenerCallbacks.connectionTerminated=terminate;
     ListenerCallbacks.logMessage=logger;
     LiInitializeAudioCallbacks(&AudioCallbacks);
-    AudioCallbacks.init=rendererInit;AudioCallbacks.start=noOp;AudioCallbacks.stop=noOp;AudioCallbacks.cleanup=rendererCleanup;
+    AudioCallbacks.init=rendererInit;AudioCallbacks.start=noOp;AudioCallbacks.stop=rendererStop;AudioCallbacks.cleanup=rendererCleanup;
     memset(&RemoteAddr,0,sizeof(RemoteAddr));memset(&LocalAddr,0,sizeof(LocalAddr));
     struct sockaddr_in address={0};address.sin_family=AF_INET;address.sin_addr.s_addr=htonl(INADDR_LOOPBACK);
     memcpy(&RemoteAddr,&address,sizeof(address));memcpy(&LocalAddr,&address,sizeof(address));AddrLen=sizeof(address);
@@ -291,6 +296,35 @@ static void failedV2CannotRevive(void) {
     uint64_t began=PltGetMillis();teardown();CHECK(PltGetMillis()-began<2000);
     int inits=atomic_load(&initialized);queueMatAudioRecoveryControl(&conflict);PltSleepMs(20);CHECK(atomic_load(&initialized)==inits);
 }
+static void stableNotificationCost(bool enabled) {
+    eventRenderer = enabled;
+    setup(false);
+    v2Prepare(1,456);
+    MAT_AUDIO_RECOVERY current = v2Start(1);
+    sendCycle(current.clientPort,456);
+    CHECK(awaitCount(&delivered,1));
+    atomic_store(&progressEpoch,456);
+    atomic_store(&progressValue,3);
+    CHECK(awaitCount(&stableCount,1));
+    unsigned before = atomic_load(&progressCalls);
+    LiNotifyMatPlaybackFailure(123,7); // A delayed callback from the previous track.
+    PltSleepMs(1000);
+    unsigned calls = atomic_load(&progressCalls) - before;
+    CHECK(!atomic_load(&failCount));
+    CHECK(enabled ? calls == 0 : calls >= 5);
+    uint64_t failedAt = PltGetMillis();
+    if (enabled) LiNotifyMatPlaybackFailure(456,7);
+    else atomic_store(&progressValue,-1);
+    CHECK(awaitCount(&failCount,1));
+    uint64_t latency = atomic_load(&failureReportedAt) - failedAt;
+    CHECK(latency < 1000); // Includes the real RTP receive-thread join.
+    printf("stable renderer events=%d progress calls/second=%u failure-to-stop=%llu ms failure-to-control=%llu ms\n",
+           enabled, calls, (unsigned long long)(atomic_load(&rendererStoppedAt) - failedAt),
+           (unsigned long long)latency);
+    teardown();
+    LiNotifyMatPlaybackFailure(456,7); // A posted focus callback after shutdown.
+    eventRenderer = false;
+}
 static void peerFailureHasNoEcho(bool cleanupBlocked) {
     setup(false);
     MAT_AUDIO_RECOVERY peer = v2Prepare(1,456);
@@ -356,6 +390,8 @@ int main(void) {
     setup(true);CHECK(requestMatAudioRecovery(1));CHECK(awaitCount(&terminated,1));teardown();
     repeatedV2WithOldPort();
     failedV2CannotRevive();
+    stableNotificationCost(false);
+    stableNotificationCost(true);
     peerFailureHasNoEcho(false);
     peerFailureHasNoEcho(true);
     blockedV2PreservesConnection();

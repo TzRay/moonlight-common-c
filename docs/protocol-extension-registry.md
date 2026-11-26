@@ -233,3 +233,7 @@ Register the progress callback with `LiSetMatPlaybackCallbacksEx` during audio
 init. A v2 attempt has one 10-second budget from PREPARE through PLAYING;
 STABLE follows 30 seconds of playback. A peer FAIL ends that attempt. A local
 cleanup failure may upgrade a retryable peer failure to BLOCKED once.
+A sized renderer may set `reportsFailures` and call `LiNotifyMatPlaybackFailure`
+with the submitted epoch/domain on output failure. After STABLE this avoids
+JNI progress polling. Renderers with only the five previous fields continue
+polling. Failure notification is local and uses the existing v2 failure message.
