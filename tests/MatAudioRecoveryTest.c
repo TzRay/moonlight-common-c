@@ -9,6 +9,8 @@ static PPLT_CRYPTO_CONTEXT testCreateCryptoContext(void) {
 #define PltCreateCryptoContext testCreateCryptoContext
 int testSendRecoveryControl(const MAT_AUDIO_RECOVERY*);
 static SOCKET testBindUdpSocket(int, struct sockaddr_storage*, SOCKADDR_LEN, int, int);
+int testSendBackgroundControl(const MAT_BACKGROUND*);
+#define sendMatBackgroundControl testSendBackgroundControl
 #define bindUdpSocket testBindUdpSocket
 #define sendMatAudioRecoveryControl testSendRecoveryControl
 #include "../src/AudioStream.c"
@@ -25,6 +27,21 @@ static uint16_t oldPort;
 static MAT_AUDIO_RECOVERY prepared;
 static PLT_MUTEX testMutex;
 static bool failNewRenderer, blockDuringCleanup;
+static atomic_int bgSentCount;
+static MAT_BACKGROUND bgSent;
+int testSendBackgroundControl(const MAT_BACKGROUND* message) {
+    PltLockMutex(&testMutex);
+    bgSent = *message;
+    PltUnlockMutex(&testMutex);
+    atomic_fetch_add(&bgSentCount, 1);
+    return 0;
+}
+static MAT_BACKGROUND latestBg(void) {
+    PltLockMutex(&testMutex);
+    MAT_BACKGROUND m = bgSent;
+    PltUnlockMutex(&testMutex);
+    return m;
+}
 static unsigned testVersion = 1;
 static atomic_int playingCount, stableCount, failCount, progressValue;
 static atomic_uint forcedPort, progressCalls;
@@ -397,6 +414,68 @@ static void lostRendererRecoversOnReplacement(void) {
     teardown();
 }
 
+static void negotiatedBackground(void) {
+    testVersion = 2;
+    NegotiatedMatBackground = true;
+    eventRenderer = true;
+    atomic_store(&bgSentCount, 0);
+    setup(false);
+    CHECK(LiGetMatBackgroundSession() == 123);
+    LiSetMatBackgroundPaused(122, true);
+    LiSetMatBackgroundPaused(123, true);
+    CHECK(awaitCount(&bgSentCount, 2)); // Drop first SUSPEND.
+    MAT_BACKGROUND pause = latestBg();
+    CHECK(pause.verb == MAT_BG_SUSPEND && pause.serial == 1 && pause.sessionEpoch == 123);
+    CHECK(!atomic_load(&cleaned) && !atomic_load(&playingCount));
+    pause.verb = MAT_BG_SUSPENDED;
+    queueMatBackgroundControl(&pause);
+    queueMatBackgroundControl(&pause);
+    CHECK(awaitCount(&cleaned, 1));
+    LiNotifyMatPlaybackFailure(123, 7);
+    CHECK(!atomic_load(&failCount) && !atomic_load(&requestCount));
+    sendCycle(oldPort, 123);
+    LiSetMatBackgroundPaused(123, false);
+    CHECK(awaitCount(&bgSentCount, 3));
+    MAT_BACKGROUND resume = latestBg();
+    CHECK(resume.verb == MAT_BG_RESUME && resume.serial == 2);
+    queueMatBackgroundControl(&pause); // Late serial 1 ACK.
+    v2Prepare(1, 456); // Obsolete in-flight attempt.
+    v2Prepare(2, 556); // New PREPARE overtakes RESUMING.
+    CHECK(!atomic_load(&readyCount));
+    resume.verb = MAT_BG_RESUMING;
+    resume.generation = 1;
+    queueMatBackgroundControl(&resume);
+    queueMatBackgroundControl(&resume);
+    MAT_AUDIO_RECOVERY next = v2Start(1);
+    CHECK(next.generation == 2 && next.newEpoch == 556);
+    sendCycle(next.clientPort, 556);
+    CHECK(awaitCount(&delivered, 1) && !atomic_load(&playingCount));
+    atomic_store(&progressEpoch, 556);
+    atomic_store(&progressValue, 1);
+    CHECK(awaitCount(&playingCount, 1));
+    CHECK(atomic_load(&initialized) == 2 && atomic_load(&cleaned) == 1 && !atomic_load(&terminated));
+    atomic_store(&progressValue, 3);
+    CHECK(awaitCount(&stableCount, 1)); // Wake the event-only worker on the next visibility change.
+    // Return to foreground before the peer finished a second suspension.
+    LiSetMatBackgroundPaused(123, true);
+    CHECK(awaitCount(&bgSentCount, 4));
+    MAT_BACKGROUND oldPause = latestBg(); oldPause.verb = MAT_BG_SUSPENDED;
+    LiSetMatBackgroundPaused(123, false);
+    queueMatBackgroundControl(&oldPause);
+    CHECK(awaitCount(&bgSentCount, 5) && atomic_load(&cleaned) == 1);
+    teardown();
+    CHECK(!LiGetMatBackgroundSession());
+    LiSetMatBackgroundPaused(123, true); // Late UI event during session teardown.
+    NegotiatedMatBackground = false;
+    eventRenderer = false;
+    setup(false);
+    CHECK(!LiGetMatBackgroundSession());
+    LiSetMatBackgroundPaused(123, true);
+    sendCycle(oldPort, 123);
+    CHECK(awaitCount(&delivered, 1) && !atomic_load(&cleaned));
+    teardown();
+}
+
 int main(void) {
     CHECK(initializePlatform()==0);CHECK(PltCreateMutex(&testMutex)==0);
     generationAllocationFailure();
@@ -415,6 +494,7 @@ int main(void) {
     peerFailureHasNoEcho(true);
     blockedV2PreservesConnection();
     lostRendererRecoversOnReplacement();
+    negotiatedBackground();
     PltDeleteMutex(&testMutex);cleanupPlatform();
     printf("MAT audio recovery: failures=%d\n",atomic_load(&failures));
     return atomic_load(&failures)?1:0;

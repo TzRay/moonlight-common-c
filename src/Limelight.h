@@ -422,6 +422,10 @@ void LiNotifyMatPlaybackFailure(uint64_t epoch, uint64_t domain);
 
 // Local audio renderer can report actual MAT playhead progress before RTSP negotiation.
 #define CAPABILITY_MAT_PLAYBACK_PROGRESS 0x00800000
+// The renderer can pass its negotiated session identity back on visibility changes.
+#define CAPABILITY_MAT_BACKGROUND_PAUSE 0x00400000
+uint64_t LiGetMatBackgroundSession(void);
+void LiSetMatBackgroundPaused(uint64_t session, bool paused);
 
 // If set in the video renderer capabilities field, this macro specifies that the renderer
 // supports slicing to increase decoding performance. The parameter specifies the desired

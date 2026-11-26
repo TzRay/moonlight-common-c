@@ -2,6 +2,7 @@
 #include "Platform.h"
 #include "MatLiveProfile.h"
 #include "MatAudioRecovery.h"
+#include "MatBackground.h"
 extern LI_MAT_LIVE_PROFILE MatLiveProfile;
 
 #include "Limelight.h"
@@ -44,6 +45,9 @@ extern int NegotiatedAudioCodec;
 // The DESCRIBE offer is distinct from the final ANNOUNCE confirmation.
 extern unsigned MatAudioRecoveryOffered;
 extern unsigned NegotiatedMatAudioRecovery;
+extern bool MatBackgroundOffered, NegotiatedMatBackground;
+int sendMatBackgroundControl(const MAT_BACKGROUND* m);
+void queueMatBackgroundControl(const MAT_BACKGROUND* m);
 extern uint32_t NegotiatedMatAudioSsrc;
 // Dynamic HDR format/fallback negotiated in the RTSP ANNOUNCE response
 // (DYNAMIC_HDR_FORMAT_* / DYNAMIC_HDR_FALLBACK_*).
