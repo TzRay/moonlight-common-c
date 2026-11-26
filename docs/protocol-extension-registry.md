@@ -180,6 +180,31 @@ than `1`, and a malformed token.
 a four-channel DualSense PCM packet on opcode `0x550A`. Their payloads are not
 defined here yet, and no host answers them today.
 
+## HTTPS adaptive bitrate feedback
+
+A version 2 host advertises `packet_sample_v2` in the `features` array of
+`GET /api/abr/capabilities`. During foreground playback a supporting client
+posts one observation per sampling tick to `/api/abr/feedback`. It includes
+`rttMs`, `decodeFps`, `droppedFrames`, `currentBitrate` and a `packetSample` object.
+
+| Member | Meaning |
+| --- | --- |
+| `expected`, `missing` | Unsigned 32-bit deltas of original packets in blocks with a known size, measured before FEC recovery. Each cumulative counter wraps independently. |
+| `coverageGaps` | Unseen blocks in observed frames plus wholly unseen frames confirmed by a later frame number. Each counts once. |
+| `deliveredFrames` | Frames handed to the decoder during the tick. |
+| `trusted` | The client has enough packet observations for a rate decision. This revision requires at least 100 originals and complete coverage. |
+| `resetWindow` | First measurement after a new baseline. Discard previous delivery-gap history. Defaults to false. |
+
+`packetLoss` reports the measured percentage when `expected` is positive.
+A tick with zero originals still carries timing and delivery information.
+A v2 host returns `newBitrate` as a recommendation with `bitrateApplied=false`.
+The client applies a current recommendation through the existing bitrate
+endpoint, serialized with manual changes. Feedback without `packetSample`
+retains the legacy numeric thresholds and host-side application. Clients
+send legacy feedback only for a trusted sample when the host lacks the
+feature. Suspending a retained session stops sampling until foreground
+playback establishes a new baseline.
+
 ## Reserved private opcodes
 
 The range `0x55F0`–`0x55FF` is reserved for future fork-private control or
