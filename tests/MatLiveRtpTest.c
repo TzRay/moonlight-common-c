@@ -204,6 +204,44 @@ static void delayedMatBlock(bool wholeBlock, unsigned delayUs, bool expectRecove
     }
     closeSession();
 }
+
+static void arrivalWindows(void) {
+    MAT_AUDIO_DIAGNOSTICS stats = {0};
+    RTP_PACKET packet = {0};
+    uint64_t base = queueClockUs;
+    stats.nextLogUs = base + 5000000;
+    recordMatArrival(&stats, &packet, base, 10000);
+    recordMatArrival(&stats, &packet, base + 4999999, 0);
+    CHECK(stats.gapSamples == 1 && stats.missingKernelIntervals == 1);
+    queueClockUs = stats.nextLogUs;
+    logMatAudioDiagnostics(&stats, "receive", false, queueClockUs);
+    recordMatArrival(&stats, &packet, queueClockUs, 20000);
+    CHECK(stats.gapSamples == 2 && stats.missingKernelIntervals == 1 && stats.maxReceiveGapUs == 1);
+    recordMatArrival(&stats, &packet, queueClockUs - 3, 20100);  // app clock rolls back independently
+    CHECK(stats.gapSamples == 2 && stats.kernelIntervals == 1 && stats.maxKernelGapUs == 100);
+    recordMatArrival(&stats, &packet, queueClockUs + 1, 14000);  // kernel realtime clock rolls back
+    CHECK(stats.gapSamples == 3 && stats.kernelIntervals == 1 && stats.missingKernelIntervals == 2);
+}
+
+static void olderBlockBeforeExpiry(void) {
+    uint8_t carrier[MAT_WIRE_CYCLE];
+    TEST_BLOCK first, middle, later;
+    beginSession();
+    makeCarrier(carrier, 0);
+    dataBlock(&first, carrier, 0, 0);
+    dataBlock(&middle, carrier, 0, 4);
+    dataBlock(&later, carrier, 0, 8);
+    packet(later.base, later.shards[0], MAT_LIVE_PACKET);
+    queueClockUs += 13999;
+    packet(middle.base, middle.shards[0], MAT_LIVE_PACKET);
+    CHECK(!terminated && rtpAudioQueue.stats.packetCountFecFailed == 0);
+    queueClockUs += 2;
+    packet(middle.base + 1, middle.shards[1], MAT_LIVE_PACKET);
+    CHECK(terminated == 1 && rtpAudioQueue.stats.packetCountFecFailed == 1);
+    packet(first.base, first.shards[0], MAT_LIVE_PACKET);
+    CHECK(rtpAudioQueue.stats.packetCountFecFailed == 1);
+    closeSession();
+}
 #endif
 
 static void permanentLoss(bool wholeBlock) {
@@ -304,6 +342,8 @@ int main(void) {
     memcpy(senderRs->p, matrix, sizeof(matrix));
     workerCallback(); fecRoundTrip(0, false, false); fecRoundTrip(1, true, false);
 #ifndef LC_AUDIO_FEC_VALIDATION
+    arrivalWindows();
+    olderBlockBeforeExpiry();
     fecRoundTrip(3, false, false); fecRoundTrip(3, true, false);
     fecRoundTrip(1u | (1u << 4), true, false); fecRoundTrip(3, true, true);
     for (int whole = 0; whole <= 1; ++whole) {

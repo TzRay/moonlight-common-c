@@ -97,11 +97,12 @@ static void recordMatGap(MAT_AUDIO_DIAGNOSTICS* d, uint64_t gap) {
 }
 
 static void recordMatArrival(MAT_AUDIO_DIAGNOSTICS* d, const RTP_PACKET* rtp, uint64_t now, uint64_t kernelUs) {
-    uint64_t gap = d->lastReceiveUs ? now - d->lastReceiveUs : 0;
+    bool haveAppGap = d->packets && now >= d->lastReceiveUs;
+    uint64_t gap = haveAppGap ? now - d->lastReceiveUs : 0;
     bool haveKernelGap = kernelUs && d->lastKernelUs && kernelUs >= d->lastKernelUs;
     uint64_t kernelGap = haveKernelGap ? kernelUs - d->lastKernelUs : 0;
-    if (d->lastReceiveUs) {
-        recordMatGap(d, gap);
+    if (d->packets) {
+        if (haveAppGap) recordMatGap(d, gap);
         if (haveKernelGap) ++d->kernelIntervals;
         else ++d->missingKernelIntervals;
         if (kernelGap > d->maxKernelGapUs) d->maxKernelGapUs = kernelGap;
@@ -129,8 +130,7 @@ static unsigned matGapP99(const MAT_AUDIO_DIAGNOSTICS* d) {
     return 64000;
 }
 
-static void logMatAudioDiagnostics(MAT_AUDIO_DIAGNOSTICS* d, const char* worker, bool force) {
-    uint64_t now = PltGetMicroseconds();
+static void logMatAudioDiagnostics(MAT_AUDIO_DIAGNOSTICS* d, const char* worker, bool force, uint64_t now) {
     if (!force && now < d->nextLogUs) return;
     Limelog("MAT audio %s: epoch=%llu packets=%llu cycles=%llu pending=%u peakPending=%u maxReceiveGapUs=%llu maxQueueAgeUs=%llu maxAuthenticateReassembleSubmitUs=%llu consumeBuckets=%llu/%llu/%llu/%llu suppressedFailures=%llu\n",
         worker, (unsigned long long)MatLiveProfile.epoch, (unsigned long long)d->packets,
@@ -141,7 +141,7 @@ static void logMatAudioDiagnostics(MAT_AUDIO_DIAGNOSTICS* d, const char* worker,
         (unsigned long long)d->consumeBuckets[1], (unsigned long long)d->consumeBuckets[2],
         (unsigned long long)d->consumeBuckets[3],
         (unsigned long long)atomic_load_explicit(&matSuppressedFailures, memory_order_relaxed));
-    Limelog("MAT gaps worker=%s samples=%llu p99FloorUs=%u kernelIntervals=%llu missingKernelIntervals=%llu maxKernelGapUs=%llu\n",
+    Limelog("MAT gaps worker=%s samples=%llu p99FloorUs=%u kernelIntervals=%llu missingKernelIntervals=%llu maxKernelGapUs=%llu (histogram=session kernel=window)\n",
         worker, (unsigned long long)d->gapSamples, matGapP99(d), (unsigned long long)d->kernelIntervals,
         (unsigned long long)d->missingKernelIntervals, (unsigned long long)d->maxKernelGapUs);
     if (d->slowStartUs) {
@@ -152,6 +152,7 @@ static void logMatAudioDiagnostics(MAT_AUDIO_DIAGNOSTICS* d, const char* worker,
     }
     d->nextLogUs = now + 5000000;
     d->maxReceiveGapUs = d->maxQueueAgeUs = d->maxConsumeUs = 0;
+    d->kernelIntervals = d->missingKernelIntervals = d->maxKernelGapUs = 0;
     d->peakQueue = 0;
     memset(d->consumeBuckets, 0, sizeof(d->consumeBuckets));
 }
@@ -166,7 +167,7 @@ static void reportMatFailure(const char* stage, MAT_AUDIO_DIAGNOSTICS* d,
         stage, (unsigned long long)MatLiveProfile.epoch, (unsigned long long)MatLiveProfile.domain,
         (unsigned long long)atomic_load_explicit(&matCompletedCycles, memory_order_relaxed),
         expectedRtp, actualRtp, error);
-    logMatAudioDiagnostics(d, stage, true);
+    logMatAudioDiagnostics(d, stage, true, PltGetMicroseconds());
     if (!requestMatAudioRecovery(MAT_RECOVERY_RETRYABLE)) ListenerCallbacks.connectionTerminated(error);
 }
 static void startMatAudioWorker(int role) {
@@ -244,7 +245,7 @@ static void consumeAudio(char* data,int size, uint64_t readyUs) {
             reportMatFailure("authentication_sequence_or_renderer",&matDecodeDiagnostics,0,0,-1);
         }
         else if(result==2&&!matPlaybackCompleteReported){matPlaybackCompleteReported=true;Limelog("Live MAT authenticated EOS and renderer drain completed\n");}
-        logMatAudioDiagnostics(&matDecodeDiagnostics, "decode", false);
+        logMatAudioDiagnostics(&matDecodeDiagnostics, "decode", false, PltGetMicroseconds());
         return;
     }
     AudioCallbacks.decodeAndPlaySample(data,size);
@@ -704,8 +705,9 @@ static void AudioReceiveThreadProc(void* context) {
         }
         uint64_t receivedUs = mat ? PltGetMicroseconds() : 0;
         if (mat) {
+            logMatAudioDiagnostics(&matReceiveDiagnostics, "receive", false, receivedUs);
+            // An interval belongs to the window in which its ending packet arrives.
             recordMatArrival(&matReceiveDiagnostics, rtp, receivedUs, kernelUs);
-            logMatAudioDiagnostics(&matReceiveDiagnostics, "receive", false);
         }
 
         if (!receivedDataFromPeer) {
@@ -863,8 +865,9 @@ static void stopAudioGeneration(void) {
     LbqSignalQueueShutdown(&packetQueue);
 
     if (AUDIO_CODEC_IS_MAT(NegotiatedAudioCodec)) {
-        logMatAudioDiagnostics(&matReceiveDiagnostics, "receive_stopped", true);
-        logMatAudioDiagnostics(&matDecodeDiagnostics, "decode_stopped", true);
+        uint64_t now = PltGetMicroseconds();
+        logMatAudioDiagnostics(&matReceiveDiagnostics, "receive_stopped", true, now);
+        logMatAudioDiagnostics(&matDecodeDiagnostics, "decode_stopped", true, now);
     }
 
     MatLivePlaybackClose(matLive);matLive=NULL;

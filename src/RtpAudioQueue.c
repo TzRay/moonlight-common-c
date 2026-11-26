@@ -346,6 +346,12 @@ static PRTPA_FEC_BLOCK getFecBlockForRtpPacket(PRTP_AUDIO_QUEUE queue, PRTP_PACK
     memset(block, 0, sizeof(*block));
 
     block->queueTimeUs = PltGetMicroseconds();
+    // A later block already proved the gap existed. Inserting a reordered
+    // older block must not start a fresh MAT grace period for that same gap.
+    if (existingBlock && AUDIO_CODEC_IS_MAT(NegotiatedAudioCodec) &&
+        existingBlock->queueTimeUs < block->queueTimeUs) {
+        block->queueTimeUs = existingBlock->queueTimeUs;
+    }
     block->blockSize = blockSize;
     memset(block->marks, 1, sizeof(block->marks));
 
@@ -548,6 +554,8 @@ static void handleMissingPackets(PRTP_AUDIO_QUEUE queue) {
             Limelog("Live MAT whole-block gap expired (expected %u, next block %u, waited %llu us)\n",
                     queue->nextRtpSequenceNumber, queue->blockHead->fecHeader.baseSequenceNumber,
                     (unsigned long long)waitUs);
+            uint16_t skipped = (uint16_t)(queue->blockHead->fecHeader.baseSequenceNumber - queue->nextRtpSequenceNumber);
+            queue->stats.packetCountFecFailed += skipped / RTPA_DATA_SHARDS;
         }
         queue->nextRtpSequenceNumber = queue->blockHead->fecHeader.baseSequenceNumber;
         queue->oldestRtpBaseSequenceNumber = queue->blockHead->fecHeader.baseSequenceNumber;
@@ -558,7 +566,7 @@ static void handleMissingPackets(PRTP_AUDIO_QUEUE queue) {
     // currently waiting on. In that case, we want to wait at least until we have a second FEC
     // block to give up on the first one. If we don't have a second block now, just keep waiting.
     LC_ASSERT_VT(isBefore16(queue->nextRtpSequenceNumber, queue->blockHead->fecHeader.baseSequenceNumber + RTPA_DATA_SHARDS));
-    if (queue->blockHead == queue->blockTail) {
+    if (queue->blockHead == queue->blockTail || queue->blockHead->allowDiscontinuity) {
         return;
     }
 
