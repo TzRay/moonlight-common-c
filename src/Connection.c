@@ -30,6 +30,7 @@ int NegotiatedAudioCodec;
 LI_MAT_LIVE_PROFILE MatLiveProfile;
 unsigned MatAudioRecoveryOffered;
 unsigned NegotiatedMatAudioRecovery;
+bool MatBackgroundOffered, NegotiatedMatBackground;
 uint32_t NegotiatedMatAudioSsrc;
 int NegotiatedAudioBitrate;
 int NegotiatedDynamicHdrFormat;
@@ -357,6 +358,7 @@ int LiStartConnection(PSERVER_INFORMATION serverInfo, PSTREAM_CONFIGURATION stre
     NegotiatedAudioBitrate = 0;
     MatAudioRecoveryOffered = false;
     NegotiatedMatAudioRecovery = false;
+    MatBackgroundOffered = NegotiatedMatBackground = false;
     memset(&MatLiveProfile,0,sizeof(MatLiveProfile));
     switch (StreamConfig.audioCodec) {
         case AUDIO_CODEC_OPUS:

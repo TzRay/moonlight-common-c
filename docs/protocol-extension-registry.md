@@ -103,8 +103,9 @@ The values are separate from both feature-flag namespaces.
 | `0x550E` | Host interactive session lock-state notifications. |
 | `0x550F` | Negotiated bidirectional MAT audio recovery. `MatAudioRecovery.h` defines the 56-byte v1 and 60-byte v2 messages, including v2 playback confirmation. |
 | `0x5510` | Client-to-host FEC aggregate summary (`SS_FEC_SUMMARY` in `Video.h`: three big-endian 32-bit words, sequence, data packets and missing data packets). |
+| `0x5511` | Bidirectional, separately negotiated MAT background suspension and generation barrier. |
 
-`0x5511`–`0x5514` are not assigned. Do not use them without adding
+`0x5512`–`0x5514` are not assigned. Do not use them without adding
 a row here that documents the payload.
 
 ### Reserved opcodes: DualSense control extensions v1
@@ -142,6 +143,26 @@ zero.
 
 A peer sends only the direction the other side declared in the SDP namespace
 below. They do not use a feature-flag bit.
+
+## MAT background suspension
+
+`0x5511` uses the reliable encrypted generic control channel. It requires MAT
+live recovery v2, renderer capability bit 22, the DESCRIBE and ANNOUNCE
+attributes `x-ss-audio.mat-background-pause:1` and
+`x-ml-audio.mat-background-pause:1`, and `X-SS-Mat-Background-Pause: 1` in
+the ANNOUNCE response. Without confirmation the existing quick-resume behavior
+is retained.
+
+The 20-byte payload has version 1, verb, two reserved zero bytes, a little-endian
+32-bit UI state serial, 64-bit initial session epoch, and 32-bit generation.
+The client sends SUSPEND (1) or RESUME (3) with its installed generation. The
+host acknowledges with SUSPENDED (2) only after all outstanding media writes
+retire, or RESUMING (4) with the last issued generation. Resume uses the
+ordinary v2 PREPARE/READY/START with a newer generation and real playback
+head confirmation. Duplicate commands resend the same acknowledgment. The
+latest serial supersedes outstanding work. BLOCKED (5) acknowledges a request
+when automatic audio recovery has already been permanently blocked. Session
+epochs isolate reconnects.
 
 ## Dynamic parameter subtypes (opcode `0x5506`)
 

@@ -185,6 +185,15 @@ int main(void) {
     run("v2 missing confirmation",both,"",true,true,true,2,-1,0);
     run("v2 missing identity",both,"X-SS-Mat-Live-Recovery: 2\r\n",true,true,true,2,-1,0);
     run("v2 mismatched confirmation",both,confirmation,true,true,true,2,-1,0);
+    const char* background="a=x-ss-audio.mat-live-recovery:1\r\na=x-ss-audio.mat-live-recovery-v2:1\r\na=x-ss-audio.mat-background-pause:1\r\n";
+    const char* confirmed="X-SS-Mat-Live-Recovery: 2\r\nX-SS-Mat-Live-Ssrc: 123456\r\nX-SS-Mat-Background-Pause: 1\r\n";
+    run("legacy renderer",background,confirmed,true,true,true,2,0,2);
+    CHECK(!NegotiatedMatBackground);
+    AudioCallbacks.capabilities |= CAPABILITY_MAT_BACKGROUND_PAUSE;
+    run("background confirmed",background,confirmed,true,true,true,2,0,2);
+    CHECK(NegotiatedMatBackground);
+    run("background omitted by host",both,"X-SS-Mat-Live-Recovery: 2\r\nX-SS-Mat-Live-Ssrc: 123456\r\n",true,true,true,2,0,2);
+    CHECK(!NegotiatedMatBackground);
     run("v2 duplicate identity",both,"X-SS-Mat-Live-Recovery: 2\r\nX-SS-Mat-Live-Ssrc: 123456\r\nX-SS-Mat-Live-Ssrc: 999\r\n",true,true,true,2,-1,0);
     run("v2 invalid identity",both,"X-SS-Mat-Live-Recovery: 2\r\nX-SS-Mat-Live-Ssrc: 4294967296\r\n",true,true,true,2,-1,0);
 #endif

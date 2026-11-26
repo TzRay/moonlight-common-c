@@ -1205,6 +1205,7 @@ int performRtspHandshake(PSERVER_INFORMATION serverInfo) {
     hasSessionId = false;
     controlStreamId = APP_VERSION_AT_LEAST(7, 1, 431) ? "streamid=control/13/0" : "streamid=control/1/0";
     AudioEncryptionEnabled = false;
+    MatBackgroundOffered = NegotiatedMatBackground = false;
     MatAudioRecoveryOffered = false;
     NegotiatedMatAudioRecovery = false;
     MicPortNumber = 0;
@@ -1534,6 +1535,10 @@ int performRtspHandshake(PSERVER_INFORMATION serverInfo) {
             MatSdpValue(response.payload, "x-ss-audio.mat-live-recovery-v2",
                         matRecoveryVersion, sizeof(matRecoveryVersion)) == 1 && !strcmp(matRecoveryVersion, "1"))
             MatAudioRecoveryOffered = 2;
+        MatBackgroundOffered = MatAudioRecoveryOffered == 2 &&
+            (AudioCallbacks.capabilities & CAPABILITY_MAT_BACKGROUND_PAUSE) &&
+            MatSdpValue(response.payload, "x-ss-audio.mat-background-pause",
+                        matRecoveryVersion, sizeof(matRecoveryVersion)) == 1 && !strcmp(matRecoveryVersion, "1");
 
         // Parse the Opus surround parameters out of the RTSP DESCRIBE response.
         ret = parseOpusConfigurations(&response);
@@ -1868,6 +1873,9 @@ int performRtspHandshake(PSERVER_INFORMATION serverInfo) {
             NegotiatedMatAudioRecovery = MatAudioRecoveryOffered;
             Limelog("Negotiated MAT audio recovery v%u on the encrypted control stream\n", NegotiatedMatAudioRecovery);
         }
+        const char* bgConfirmation = uniqueMatOption(response.options, "X-SS-Mat-Background-Pause");
+        NegotiatedMatBackground = MatBackgroundOffered && NegotiatedMatAudioRecovery == 2 &&
+                                  bgConfirmation && !strcmp(bgConfirmation, "1");
         if (recoveryConfirmation == NULL && MatAudioRecoveryOffered == 2 &&
                 NegotiatedAudioCodec == AUDIO_CODEC_MAT_LIVE && APP_VERSION_AT_LEAST(7, 1, 431) &&
                 (EncryptionFeaturesEnabled & SS_ENC_CONTROL_V2) && AudioPingPayload.payload[0]) {
@@ -1980,7 +1988,7 @@ int performRtspHandshake(PSERVER_INFORMATION serverInfo) {
     ret = 0;
 
 Exit:
-    if (ret != 0) NegotiatedMatAudioRecovery = false;
+    if (ret != 0) { NegotiatedMatAudioRecovery = 0; NegotiatedMatBackground = false; }
     // Cleanup the ENet stuff
     if (useEnet) {
         if (peer != NULL) {

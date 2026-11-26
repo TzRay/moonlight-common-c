@@ -619,6 +619,7 @@ static PSDP_OPTION getAttributesList(char*urlSafeAddr) {
                 if (MatAudioRecoveryOffered && APP_VERSION_AT_LEAST(7, 1, 431) &&
                         (EncryptionFeaturesEnabled & SS_ENC_CONTROL_V2) &&
                         AudioPingPayload.payload[0] != 0) {
+                    if (MatBackgroundOffered) err |= addAttributeString(&optionHead,"x-ml-audio.mat-background-pause","1");
                     err |= addAttributeString(&optionHead,"x-ml-audio.mat-live-recovery",MatAudioRecoveryOffered == 2 ? "2" : "1");
                 }
             }

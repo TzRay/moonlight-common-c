@@ -1797,6 +1797,13 @@ static void controlReceiveThreadFunc(void* context) {
                     Ds5HapticsStateCallback(controller, state);
                 }
             }
+            else if (ctlHdr->type == MAT_BACKGROUND_PTYPE) {
+                MAT_BACKGROUND message;
+                if (NegotiatedMatBackground && encryptedControlStream && (EncryptionFeaturesEnabled & SS_ENC_CONTROL_V2) &&
+                    MatBackgroundDecode((const uint8_t*)(ctlHdr + 1), packetLength - sizeof(*ctlHdr), &message) &&
+                    (message.verb == MAT_BG_SUSPENDED || message.verb == MAT_BG_RESUMING || message.verb == MAT_BG_BLOCKED))
+                    queueMatBackgroundControl(&message);
+            }
             else if (ctlHdr->type == MAT_RECOVERY_PACKET_TYPE) {
                 MAT_AUDIO_RECOVERY recovery;
                 if (NegotiatedMatAudioRecovery && IS_SUNSHINE() && encryptedControlStream &&
@@ -2266,6 +2273,15 @@ int sendInputPacketOnControlStream(unsigned char* data, int length, uint8_t chan
 }
 
 // Called only by the audio recovery worker, outside the control receive thread.
+int sendMatBackgroundControl(const MAT_BACKGROUND* m) {
+    if (!NegotiatedMatBackground || !encryptedControlStream || !(EncryptionFeaturesEnabled & SS_ENC_CONTROL_V2) ||
+        stopping || !peer || peer->state != ENET_PEER_STATE_CONNECTED) return -1;
+    uint8_t data[MAT_BACKGROUND_BYTES];
+    MatBackgroundEncode(data, m);
+    return sendMessageAndForget(MAT_BACKGROUND_PTYPE, sizeof(data), data, CTRL_CHANNEL_GENERIC,
+                                ENET_PACKET_FLAG_RELIABLE, false) ? 0 : -1;
+}
+
 int sendMatAudioRecoveryControl(const MAT_AUDIO_RECOVERY* recovery) {
     uint8_t payload[MAT_RECOVERY_V2_BYTES];
     MAT_AUDIO_RECOVERY decoded;
