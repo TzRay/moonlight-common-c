@@ -584,6 +584,14 @@ uint32_t RtpvGetCurrentFrameNumber(PRTP_VIDEO_QUEUE queue) {
     return queue->currentFrameNumber;
 }
 
+bool RtpvShouldDiscardEncryptedFrame(PRTP_VIDEO_QUEUE queue, uint32_t number) {
+    const RTPV_FRAME_OBSERVATION* o = &queue->observation;
+    // A sequential frame may be abandoned before the sender finishes its
+    // healthy tail blocks. Authenticate those packets to measure their delivery.
+    if (o->abandoned && number == o->frame && o->finalized != (1U << o->count) - 1) return false;
+    return isBefore32(number, RtpvGetCurrentFrameNumber(queue));
+}
+
 // Seal a block once, with the count at delivery or abandonment. Missing
 // blocks have no fecInfo from which to learn their data/parity split.
 static void finishObservation(RTPV_FRAME_OBSERVATION* observation, unsigned group) {
@@ -601,7 +609,8 @@ static void finishObservation(RTPV_FRAME_OBSERVATION* observation, unsigned grou
 }
 
 static void observeVideoShard(PRTP_VIDEO_QUEUE queue, uint32_t number, unsigned group,
-                              unsigned count, unsigned data, unsigned index, bool interleaved) {
+                              unsigned count, unsigned data, unsigned index, bool interleaved,
+                              PRTP_PACKET packet, unsigned parity) {
     RTPV_FRAME_OBSERVATION* observation = &queue->observation;
     if (!observation->count || number != observation->frame) {
         uint32_t expected = observation->count ? observation->frame + 1 : 1;
@@ -609,21 +618,25 @@ static void observeVideoShard(PRTP_VIDEO_QUEUE queue, uint32_t number, unsigned 
         for (unsigned g = 0; g < observation->count; g++) finishObservation(observation, g);
         if (number != expected) connectionRecordVideoCoverageGaps(number - expected);
         observation->frame = number;
+        observation->timestamp = packet->timestamp;
+        observation->abandoned = false;
         observation->count = count;
         observation->finalized = 0;
         for (unsigned g = 0; g < count; g++) observation->blocks[g].data = 0;
     }
-    if (count != observation->count || (observation->finalized & (1U << group))) return;
+    if (count != observation->count || packet->timestamp != observation->timestamp || (observation->finalized & (1U << group))) return;
     RTPV_BLOCK_OBSERVATION* block = &observation->blocks[group];
     if (!block->data) {
         if (!interleaved) {
             for (unsigned g = 0; g < group; g++) finishObservation(observation, g);
         }
         block->data = data;
+        block->parity = parity;
+        block->base = U16(packet->sequenceNumber - index);
         block->received = 0;
         memset(block->seen, 0, ((data + 63) / 64) * sizeof(block->seen[0]));
     }
-    if (block->data == data && index < data) {
+    if (block->data == data && block->parity == parity && block->base == U16(packet->sequenceNumber - index) && index < data) {
         uint64_t mask = UINT64_C(1) << (index % 64);
         uint64_t* seen = &block->seen[index / 64];
         if (!(*seen & mask)) {
@@ -631,6 +644,17 @@ static void observeVideoShard(PRTP_VIDEO_QUEUE queue, uint32_t number, unsigned 
             if (++block->received == data) finishObservation(observation, group);
         }
     }
+}
+
+// The sequential queue calls this after acceptance, or when the first valid
+// shard after a lost block proves that the decoder must abandon the frame.
+static void observeSequentialShard(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, PNV_VIDEO_PACKET nv, bool abandoned) {
+    const unsigned data = nv->fecInfo >> 22;
+    if (!data) return; // Old senders can omit the FEC metadata.
+    const unsigned parity = (data * ((nv->fecInfo >> 4) & 0xff) + 99) / 100;
+    observeVideoShard(queue, nv->frameIndex, (nv->multiFecBlocks >> 4) & 3, (nv->multiFecBlocks >> 6) + 1,
+                      data, (nv->fecInfo >> 12) & 0x3ff, false, packet, parity);
+    if (abandoned && queue->observation.frame == nv->frameIndex) queue->observation.abandoned = true;
 }
 
 static int addSequentialPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length,
@@ -690,6 +714,7 @@ static int addSequentialPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int l
                 nvPacket->frameIndex != queue->currentFrameNumber) {
             connectionSawFrame(nvPacket->frameIndex);
         }
+        observeSequentialShard(queue, packet, nvPacket, false);
         queue->currentFrameNumber = nvPacket->frameIndex;
         packetEntry->next = NULL;
         packetEntry->prev = NULL;
@@ -745,6 +770,7 @@ static int addSequentialPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int l
 
                     // NB: We reset reportedLostFrame here because we don't want to suppress
                     // the reporting of the _next_ frame if it's lost.
+                    if (!firstRecvTimeUs) observeSequentialShard(queue, packet, nvPacket, true);
                     queue->currentFrameNumber++;
                     queue->multiFecCurrentBlockNumber = 0;
                     queue->reportedLostFrame = false;
@@ -782,6 +808,7 @@ static int addSequentialPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int l
             //
             // NB: We reset reportedLostFrame here because we don't want to suppress
             // the reporting of the _next_ frame if it's lost.
+            if (!firstRecvTimeUs) observeSequentialShard(queue, packet, nvPacket, true);
             queue->currentFrameNumber = nvPacket->frameIndex + 1;
             queue->multiFecCurrentBlockNumber = 0;
             queue->reportedLostFrame = false;
@@ -844,6 +871,12 @@ static int addSequentialPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int l
         return RTPF_RET_REJECTED;
     }
 
+    if ((nvPacket->fecInfo >> 22) != queue->bufferDataPackets ||
+        ((nvPacket->fecInfo >> 4) & 0xff) != queue->fecPercentage ||
+        ((nvPacket->multiFecBlocks >> 6) & 3) != queue->multiFecLastBlockNumber ||
+        (queue->fecPercentage && U16(packet->sequenceNumber - fecIndex) != queue->bufferLowestSequenceNumber)) {
+        return RTPF_RET_REJECTED;
+    }
     LC_ASSERT_VT(!queue->fecPercentage || U16(packet->sequenceNumber - fecIndex) == queue->bufferLowestSequenceNumber);
     LC_ASSERT_VT((nvPacket->fecInfo & 0xFF0) >> 4 == queue->fecPercentage);
     LC_ASSERT_VT((nvPacket->fecInfo & 0xFFC00000) >> 22 == queue->bufferDataPackets);
@@ -893,6 +926,8 @@ static int addSequentialPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int l
             queue->receivedParityPackets++;
             LC_ASSERT(queue->receivedParityPackets <= queue->bufferParityPackets);
         }
+
+        if (!firstRecvTimeUs) observeSequentialShard(queue, packet, nvPacket, false);
 
         // Try to submit this frame. If we haven't received enough packets,
         // this will fail and we'll keep waiting.
@@ -1000,15 +1035,39 @@ int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_
     const bool mixed = VideoFecInterleavingEnabled && (fec & SS_FEC_INFO_INTERLEAVED);
     const bool validShard = group < count && data && index < data + parity;
     INTERLEAVED_FRAME* frame = queue->interleaved;
+    if (fec && !validShard) return RTPF_RET_REJECTED;
+
+    const RTPV_FRAME_OBSERVATION* observation = &queue->observation;
+    if (observation->count && number == observation->frame &&
+        (count != observation->count || packet->timestamp != observation->timestamp)) return RTPF_RET_REJECTED;
+
+    const uint32_t current = RtpvGetCurrentFrameNumber(queue);
+    if (!isBefore32(number, current) && number - current > UINT16_MAX) {
+        // Even one shard per skipped frame would have wrapped the entire RTP
+        // sequence space. Corroborate this discontinuity with the next frame
+        // before replacing the current queue or attributing the coverage gap.
+        if (!queue->awaitingFrameConfirmation || number != queue->discontinuousFrame + 1) {
+            queue->discontinuousFrame = number;
+            queue->awaitingFrameConfirmation = true;
+            return RTPF_RET_REJECTED;
+        }
+    }
     if (!mixed) {
+        if (isBefore32(number, current)) {
+            if (validShard && observation->abandoned && number == observation->frame) {
+                observeVideoShard(queue, number, group, count, data, index, false, packet, parity);
+            }
+            return RTPF_RET_REJECTED;
+        }
+        if (NegotiatedVideoFormat != VIDEO_FORMAT_PYROWAVE &&
+                isBefore16(packet->sequenceNumber, queue->nextContiguousSequenceNumber)) return RTPF_RET_REJECTED;
         if (frame != NULL && frame->count) {
             if (!isBefore32(frame->number, number)) return RTPF_RET_REJECTED;
             drainInterleavedBlocks(queue, true, 0);
         }
-        // A late packet from an already abandoned frame can still describe
-        // a known block. The observation has its own frame/block watermark.
-        if (validShard) observeVideoShard(queue, number, group, count, data, index, false);
-        return addSequentialPacket(queue, packet, length, entry, 0);
+        int result = addSequentialPacket(queue, packet, length, entry, 0);
+        if (result != RTPF_RET_REJECTED) queue->awaitingFrameConfirmation = false;
+        return result;
     }
 
     const uint16_t base = U16(packet->sequenceNumber - index);
@@ -1052,7 +1111,8 @@ int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_
     frame->finishedData |= nv->multiFecBlocks & 0x0f;
     nv->multiFecBlocks &= 0xf0;
     nv->fecInfo = LE32(fec & ~SS_FEC_INFO_INTERLEAVED);
-    observeVideoShard(queue, number, group, count, data, index, true);
+    queue->awaitingFrameConfirmation = false;
+    observeVideoShard(queue, number, group, count, data, index, true, packet, parity);
     entry->packet = packet;
     entry->length = length;
     block->shards[index] = entry;

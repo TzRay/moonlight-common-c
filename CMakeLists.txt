@@ -249,7 +249,8 @@ if (BUILD_TESTING)
 
     add_executable(video-fec-interleave-tests tests/VideoFecInterleaveTest.c)
     add_executable(video-fec-socket-tests tests/VideoFecSocketTest.c)
-    foreach(test IN ITEMS video-fec-interleave video-fec-socket)
+    add_executable(udp-receive-error-tests tests/UdpReceiveErrorTest.c)
+    foreach(test IN ITEMS video-fec-interleave video-fec-socket udp-receive-error)
       target_include_directories(${test}-tests PRIVATE enet/include
         $<TARGET_PROPERTY:moonlight-common-c,INCLUDE_DIRECTORIES>)
       target_compile_definitions(${test}-tests PRIVATE

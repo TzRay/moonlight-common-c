@@ -92,6 +92,25 @@ static void checkBoundary(void) {
     RtpvCleanupQueue(&queue);
 }
 
+static void checkMultipleDeadlines(void) {
+    RTP_VIDEO_QUEUE queue;
+    RtpvInitializeQueue(&queue);
+    prepare(1, 0);
+    for (unsigned g = 0; g < GROUPS; g++) {
+        nowUs += 100;
+        for (unsigned i = 0; i < DATA - 1; i++) sendShard(&queue, g, i, true, 0);
+        sendShard(&queue, g, DATA, true, 0);
+        sendShard(&queue, g, DATA + 1, true, 0);
+    }
+    uint64_t firstDeadline = RtpvGetRecoveryDeadlineUs(&queue);
+    CHECK(firstDeadline);
+    RtpvExpireRecoveryDeadline(&queue, firstDeadline);
+    CHECK(!delivered && RtpvGetRecoveryDeadlineUs(&queue) == firstDeadline + 100);
+    RtpvExpireRecoveryDeadline(&queue, firstDeadline + 300);
+    CHECK(delivered == GROUPS * DATA && repaired == GROUPS);
+    RtpvCleanupQueue(&queue);
+}
+
 int main(void) {
     RTP_VIDEO_QUEUE queue;
     CHECK(initializePlatform() == 0);
@@ -113,15 +132,27 @@ int main(void) {
     prepare(4, first + GROUPS * TOTAL);
     CHECK(runFrame(&queue, true, 24, false) && repaired == 24 && !lost);
 
+    uint32_t previousGaps = LiGetVideoPacketCoverageGaps();
+    uint64_t previousPackets = LiGetObservedVideoDataPackets();
     prepare(5, first + GROUPS * TOTAL);
     CHECK(!runFrame(&queue, true, 96, false));
     prepare(6, first + GROUPS * TOTAL);
     CHECK(runFrame(&queue, false, 0, false) == sequential && lost == 1);
+    CHECK(LiGetObservedVideoDataPackets() > previousPackets);
+    // Lose group zero completely on a separate frame and verify the public gap
+    // counter after a sequential next frame seals the interleaved observation.
     prepare(7, first + GROUPS * TOTAL);
+    for (unsigned g = 1; g < GROUPS; g++)
+        for (unsigned i = 0; i < TOTAL; i++) sendShard(&queue, g, i, true, 15);
+    prepare(8, first + GROUPS * TOTAL);
+    CHECK(runFrame(&queue, false, 0, false) == sequential);
+    CHECK(LiGetVideoPacketCoverageGaps() == previousGaps + 1);
+    prepare(9, first + GROUPS * TOTAL);
     sendShard(&queue, 3, 5, true, 0); // Stop with a later group outstanding.
     RtpvCleanupQueue(&queue);
     compareWindows();
     checkBoundary();
+    checkMultipleDeadlines();
     cleanupPlatform();
     printf("ready packet: sequential %u, interleaved %u of %u; recovered 24 originals\n",
            sequential, interleaved, GROUPS * TOTAL);

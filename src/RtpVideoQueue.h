@@ -21,13 +21,14 @@ typedef struct _RTPV_QUEUE_LIST {
 
 // Observations follow the wire even after the decoder has abandoned a frame.
 typedef struct {
-    uint16_t data, received;
+    uint16_t data, received, base, parity;
     uint64_t seen[16]; // Ten-bit original shard indices.
 } RTPV_BLOCK_OBSERVATION;
 
 typedef struct {
-    uint32_t frame;
+    uint32_t frame, timestamp;
     uint8_t count, finalized;
+    bool abandoned;
     RTPV_BLOCK_OBSERVATION blocks[4];
 } RTPV_FRAME_OBSERVATION;
 
@@ -53,6 +54,8 @@ typedef struct _RTP_VIDEO_QUEUE {
     bool reportedLostFrame;
 
     uint32_t currentFrameNumber;
+    uint32_t discontinuousFrame;
+    bool awaitingFrameConfirmation;
 
     bool multiFecCapable;
     uint8_t multiFecCurrentBlockNumber;
@@ -77,4 +80,5 @@ void RtpvExpireRecoveryDeadline(PRTP_VIDEO_QUEUE queue, uint64_t nowUs);
 void RtpvCleanupQueue(PRTP_VIDEO_QUEUE queue);
 int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_QUEUE_ENTRY packetEntry);
 uint32_t RtpvGetCurrentFrameNumber(PRTP_VIDEO_QUEUE queue);
+bool RtpvShouldDiscardEncryptedFrame(PRTP_VIDEO_QUEUE queue, uint32_t number);
 void RtpvSubmitQueuedPackets(PRTP_VIDEO_QUEUE queue);

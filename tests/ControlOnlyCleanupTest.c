@@ -6,6 +6,7 @@
 static int avCalls, controlCalls, inputCalls, platformCalls;
 bool EndpointRefreshRequested;
 bool VideoFecControlSupported;
+bool VideoFecInterleavingEnabled;
 void LiSetEndpointAutoRefreshEnabled(bool enabled) {
     (void) enabled;
 }
