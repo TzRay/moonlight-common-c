@@ -212,6 +212,7 @@ typedef struct {
     uint64_t gapSamples;
 } MAT_AUDIO_DIAGNOSTICS;
 static MAT_AUDIO_DIAGNOSTICS matReceiveDiagnostics, matDecodeDiagnostics;
+#define MAT_DIAGNOSTIC_INTERVAL_US 5000000
 #define MAT_PACKET_QUEUE_BOUND 512
 static void recordMatGap(MAT_AUDIO_DIAGNOSTICS* d, uint64_t gap) {
     unsigned bucket = gap >= 64000 ? 2560 : (unsigned)(gap / 25);
@@ -254,7 +255,12 @@ static unsigned matGapP99(const MAT_AUDIO_DIAGNOSTICS* d) {
 }
 
 static void logMatAudioDiagnostics(MAT_AUDIO_DIAGNOSTICS* d, const char* worker, bool force, uint64_t now) {
-    if (!force && now < d->nextLogUs) return;
+    if (!force && now < d->nextLogUs) {
+        // The fallback wall clock can step behind the start of this window.
+        if (d->nextLogUs - now > MAT_DIAGNOSTIC_INTERVAL_US)
+            d->nextLogUs = now + MAT_DIAGNOSTIC_INTERVAL_US;
+        return;
+    }
     Limelog("MAT audio %s: epoch=%llu packets=%llu cycles=%llu pending=%u peakPending=%u maxReceiveGapUs=%llu maxQueueAgeUs=%llu maxAuthenticateReassembleSubmitUs=%llu consumeBuckets=%llu/%llu/%llu/%llu suppressedFailures=%llu\n",
         worker, (unsigned long long)MatLiveProfile.epoch, (unsigned long long)d->packets,
         (unsigned long long)atomic_load_explicit(&matCompletedCycles, memory_order_relaxed),
@@ -273,7 +279,7 @@ static void logMatAudioDiagnostics(MAT_AUDIO_DIAGNOSTICS* d, const char* worker,
             (unsigned long long)d->slowQueueUs, (unsigned long long)d->slowProcessUs, (unsigned long long)d->slowSubmitUs);
         d->slowStartUs = 0;
     }
-    d->nextLogUs = now + 5000000;
+    d->nextLogUs = now + MAT_DIAGNOSTIC_INTERVAL_US;
     d->maxReceiveGapUs = d->maxQueueAgeUs = d->maxConsumeUs = 0;
     d->kernelIntervals = d->missingKernelIntervals = d->maxKernelGapUs = 0;
     d->peakQueue = 0;
@@ -534,7 +540,7 @@ static int initializeAudioGeneration(void) {
     // A new socket has a new RTP sequence and kernel clock baseline. Keep the session histograms.
     memset(&matReceiveDiagnostics, 0, offsetof(MAT_AUDIO_DIAGNOSTICS, gapHistogram));
     memset(&matDecodeDiagnostics, 0, offsetof(MAT_AUDIO_DIAGNOSTICS, gapHistogram));
-    matReceiveDiagnostics.nextLogUs = matDecodeDiagnostics.nextLogUs = PltGetMicroseconds() + 5000000;
+    matReceiveDiagnostics.nextLogUs = matDecodeDiagnostics.nextLogUs = PltGetMicroseconds() + MAT_DIAGNOSTIC_INTERVAL_US;
     receivedDataFromPeer = false;
     pingThreadStarted = false;
     firstReceiveTime = 0;

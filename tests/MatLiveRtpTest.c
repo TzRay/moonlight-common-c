@@ -221,6 +221,14 @@ static void arrivalWindows(void) {
     CHECK(stats.gapSamples == 2 && stats.kernelIntervals == 1 && stats.maxKernelGapUs == 100);
     recordMatArrival(&stats, &packet, queueClockUs + 1, 14000);  // kernel realtime clock rolls back
     CHECK(stats.gapSamples == 3 && stats.kernelIntervals == 1 && stats.missingKernelIntervals == 2);
+    // A large application clock correction must not silence periodic reports until it catches up.
+    const uint64_t correctedUs = 1000;
+    logMatAudioDiagnostics(&stats, "receive", false, correctedUs);
+    CHECK(stats.nextLogUs == correctedUs + 5000000 && stats.kernelIntervals == 1);
+    logMatAudioDiagnostics(&stats, "receive", false, correctedUs + 4999999);
+    CHECK(stats.kernelIntervals == 1 && stats.missingKernelIntervals == 2);
+    logMatAudioDiagnostics(&stats, "receive", false, correctedUs + 5000000);
+    CHECK(stats.gapSamples == 3 && stats.kernelIntervals == 0 && stats.missingKernelIntervals == 0);
 }
 
 static void olderBlockBeforeExpiry(void) {
