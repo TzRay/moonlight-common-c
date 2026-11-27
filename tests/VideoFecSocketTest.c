@@ -45,12 +45,17 @@ static void transmitEncrypted(const void* bytes, size_t size) {
 }
 
 static unsigned probes, degraded, timedPolls, terminated, mediaPackets;
+static unsigned middleOriginals, firstFramePackets;
+static uint64_t initialObserved;
+static uint32_t initialGaps;
+static void checkEncryptedObservation(void);
 static int terminationCode;
 static void recordTermination(int code) { terminated++; terminationCode = code; }
 
 static int receiveTimed(LI_ENDPOINT_REFRESH* state, SOCKET* s, char* packet, int size,
                         bool fallback, uint64_t deadline, uint64_t* timestamp) {
     CHECK(fallback == failTimeout);
+    if (encryptedReplay && mediaPackets >= firstFramePackets) checkEncryptedObservation();
     uint64_t realDeadline = 0;
     bool enabled = LiIsEndpointAutoRefreshEnabled();
     if (deadline) {
@@ -100,8 +105,23 @@ static int receiveTimed(LI_ENDPOINT_REFRESH* state, SOCKET* s, char* packet, int
 #define setNonFatalRecvTimeoutMs setTimeout
 #include "../src/VideoStream.c"
 
+static void checkEncryptedObservation(void) {
+    uint64_t observed = LiGetObservedVideoDataPackets();
+    uint32_t total = (uint32_t)observed - (uint32_t)initialObserved;
+    uint32_t missing = (uint32_t)(observed >> 32) - (uint32_t)(initialObserved >> 32);
+    // The abandoned last block lacks one original and cannot settle until frame two.
+    bool nextFrame = mediaPackets > firstFramePackets;
+    unsigned settled = middleOriginals ? 3 : 2;
+    CHECK(rtpQueue.observation.frame == (nextFrame ? 2U : 1U));
+    if (!nextFrame) CHECK(rtpQueue.observation.abandoned);
+    CHECK(total == (settled + (unsigned)nextFrame) * DATA);
+    CHECK(missing == (middleOriginals ? DATA - middleOriginals : 0) + (unsigned)nextFrame);
+    CHECK(LiGetVideoPacketCoverageGaps() - initialGaps == (middleOriginals ? 0U : 1U));
+}
+
 static void runSocketReplay(bool refresh, bool fallback) {
     latePackets = 0;
+    lost = 0;
     nowUs = 1000000;
     endpointOffsetMs = 0;
     failTimeout = fallback;
@@ -120,22 +140,35 @@ static void runSocketReplay(bool refresh, bool fallback) {
 
     RtpvInitializeQueue(&rtpQueue);
     prepare(1, 0);
-    uint64_t observed = LiGetObservedVideoDataPackets();
-    uint32_t gaps = LiGetVideoPacketCoverageGaps();
     if (encryptedReplay) {
+        initialObserved = LiGetObservedVideoDataPackets();
+        initialGaps = LiGetVideoPacketCoverageGaps();
+        firstFramePackets = 0;
         for (unsigned g = 0; g < GROUPS; g++) {
-            if (g == 1) continue;
-            for (unsigned i = 0; i <= DATA; i++) sendShard(NULL, g, i, false, 0);
+            unsigned count = g == 1 ? middleOriginals : DATA + 1;
+            for (unsigned i = 0; i < count; i++) {
+                if (g == GROUPS - 1 && i == DATA - 1) continue;
+                sendShard(NULL, g, i, false, 0);
+                firstFramePackets++;
+            }
         }
-        sendShardNumber(NULL, 0, 0, false, 0, 2);
+        prepare(2, GROUPS * TOTAL);
+        sendShard(NULL, 0, 0, false, 0);
+        sendShard(NULL, 0, 0, false, 0); // Duplicate of the new frame's first packet
+        prepare(1, 0);
+        sendShard(NULL, GROUPS - 1, DATA - 1, false, 0); // Late original from the retired frame
     }
     else staticDesktop(&rtpQueue, 8);
     VideoReceiveThreadProc(NULL);
     CHECK(terminated == 1 && terminationCode == ML_ERROR_NO_VIDEO_TRAFFIC);
     if (encryptedReplay) {
-        CHECK(!delivered && lost && !repaired && !timedPolls);
-        CHECK(LiGetObservedVideoDataPackets() - observed == 3 * DATA);
-        CHECK(LiGetVideoPacketCoverageGaps() - gaps == 1);
+        CHECK(!delivered && lost && !timedPolls && mediaPackets == firstFramePackets + 3);
+        checkEncryptedObservation();
+        uint64_t observed = LiGetObservedVideoDataPackets();
+        printf("encrypted next frame, previous middle block %u/%u: total %u, missing %u, unknown blocks %u\n",
+               middleOriginals, DATA, (uint32_t)observed - (uint32_t)initialObserved,
+               (uint32_t)(observed >> 32) - (uint32_t)(initialObserved >> 32),
+               LiGetVideoPacketCoverageGaps() - initialGaps);
     }
     else {
         CHECK(delivered == GROUPS * DATA && repaired == !lateOriginal && !lost);
@@ -182,6 +215,8 @@ int main(void) {
     decryptionCtx = PltCreateCryptoContext();
     CHECK(encryptCtx && decryptionCtx);
     sendOnSocket = transmitEncrypted;
+    runSocketReplay(false, false);
+    middleOriginals = 9;
     runSocketReplay(false, false);
     PltDestroyCryptoContext(decryptionCtx);
     PltDestroyCryptoContext(encryptCtx);

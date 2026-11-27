@@ -104,6 +104,7 @@ static PLT_THREAD controlReceiveThread;
 static PLT_THREAD asyncCallbackThread;
 static uint32_t lastGoodFrame;
 static uint32_t lastSeenFrame;
+static atomic_bool hasSeenFrame;
 static bool stopping;
 static bool disconnectPending;
 static bool encryptedControlStream;
@@ -637,6 +638,7 @@ int initializeControlStream(void) {
 
     lastGoodFrame = 0;
     lastSeenFrame = 0;
+    atomic_store_explicit(&hasSeenFrame, false, memory_order_relaxed);
     disconnectPending = false;
     intervalGoodFrameCount = 0;
     intervalTotalFrameCount = 0;
@@ -806,18 +808,19 @@ void connectionSendFrameFecStatus(PSS_FRAME_FEC_STATUS fecStatus) {
 }
 
 void connectionSawFrame(uint32_t frameIndex) {
-    LC_ASSERT_VT(!isBefore32(frameIndex, lastSeenFrame));
-
     uint64_t now = PltGetMillis();
 
     // Suppress connection status warnings for the first sampling period
     // to allow the network and host to settle.
-    if (lastSeenFrame == 0) {
+    if (!atomic_load_explicit(&hasSeenFrame, memory_order_relaxed)) {
         lastSeenFrame = frameIndex;
         firstFrameTimeMs = now;
+        atomic_store_explicit(&hasSeenFrame, true, memory_order_relaxed);
         return;
     }
-    else if (now - firstFrameTimeMs < CONN_STATUS_SAMPLE_PERIOD) {
+
+    LC_ASSERT_VT(!isBefore32(frameIndex, lastSeenFrame));
+    if (now - firstFrameTimeMs < CONN_STATUS_SAMPLE_PERIOD) {
         lastSeenFrame = frameIndex;
         return;
     }
@@ -1880,7 +1883,7 @@ static void controlReceiveThreadFunc(void* context) {
                         terminationErrorCode = ML_ERROR_PROTECTED_CONTENT;
                         break;
                     case 0x80030023: // NVST_DISCONN_SERVER_TERMINATED_CLOSED
-                        if (lastSeenFrame != 0) {
+                        if (atomic_load_explicit(&hasSeenFrame, memory_order_relaxed)) {
                             // Pass error code 0 to notify the client that this was not an error
                             terminationErrorCode = ML_ERROR_GRACEFUL_TERMINATION;
                         }
@@ -1905,7 +1908,7 @@ static void controlReceiveThreadFunc(void* context) {
 
                     // SERVER_TERMINATED_INTENDED
                     if (terminationReason == 0x0100) {
-                        if (lastSeenFrame != 0) {
+                        if (atomic_load_explicit(&hasSeenFrame, memory_order_relaxed)) {
                             // Pass error code 0 to notify the client that this was not an error
                             terminationErrorCode = ML_ERROR_GRACEFUL_TERMINATION;
                         }

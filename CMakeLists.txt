@@ -84,34 +84,28 @@ else()
   endif()
 endif()
 
-if (NOT(MSVC OR APPLE))
-  include(CheckLibraryExists)
-  CHECK_LIBRARY_EXISTS(rt clock_gettime "" HAVE_CLOCK_GETTIME)
-
-  if (NOT HAVE_CLOCK_GETTIME)
-    set(CMAKE_EXTRA_INCLUDE_FILES time.h)
-    CHECK_FUNCTION_EXISTS(clock_gettime HAVE_CLOCK_GETTIME)
-    SET(CMAKE_EXTRA_INCLUDE_FILES)
-  endif()
-
-  foreach(clock CLOCK_MONOTONIC CLOCK_MONOTONIC_RAW)
-    message(STATUS "Testing whether ${clock} can be used")
-    CHECK_CXX_SOURCE_COMPILES(
-"#define _POSIX_C_SOURCE 200112L
+if(UNIX AND NOT APPLE)
+  include(CheckCSourceCompiles)
+  include(CMakePushCheckState)
+  set(_monotonic_probe "#define _POSIX_C_SOURCE 200112L
 #include <time.h>
-int main ()
-{
-  struct timespec ts[1];
-  clock_gettime (${clock}, ts);
-  return 0;
-}" HAVE_${clock})
-    if(HAVE_${clock})
-    message(STATUS "Testing whether ${clock} can be used -- Success")
-    else()
-    message(STATUS "Testing whether ${clock} can be used -- Failed")
+int main(void) {
+  struct timespec ts;
+  return clock_gettime(CLOCK_MONOTONIC, &ts);
+}")
+  check_c_source_compiles("${_monotonic_probe}" MOONLIGHT_CLOCK_IN_LIBC)
+  if(NOT MOONLIGHT_CLOCK_IN_LIBC)
+    cmake_push_check_state()
+    list(APPEND CMAKE_REQUIRED_LIBRARIES rt)
+    check_c_source_compiles("${_monotonic_probe}" MOONLIGHT_CLOCK_IN_LIBRT)
+    cmake_pop_check_state()
+    if(MOONLIGHT_CLOCK_IN_LIBRT)
+      target_link_libraries(moonlight-common-c PRIVATE rt)
     endif()
-  endforeach()
-
+  endif()
+  if(MOONLIGHT_CLOCK_IN_LIBC OR MOONLIGHT_CLOCK_IN_LIBRT)
+    target_compile_definitions(moonlight-common-c PRIVATE HAVE_CLOCK_GETTIME=1)
+  endif()
 endif()
 
 target_include_directories(moonlight-common-c SYSTEM PUBLIC src)
@@ -206,6 +200,16 @@ if (BUILD_TESTING)
 
   get_target_property(_common_c_type moonlight-common-c TYPE)
   if(_common_c_type STREQUAL "STATIC_LIBRARY")
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND (MOONLIGHT_CLOCK_IN_LIBC OR MOONLIGHT_CLOCK_IN_LIBRT))
+      add_executable(posix-clock-tests tests/PosixClockTest.c)
+      target_include_directories(posix-clock-tests PRIVATE enet/include)
+      target_link_libraries(posix-clock-tests PRIVATE moonlight-common-c
+        "-Wl,--wrap=clock_gettime" "-Wl,--wrap=gettimeofday")
+      add_test(NAME posix-fallback-clock-tests COMMAND posix-clock-tests fallback)
+      add_test(NAME posix-rtp-clock-tests COMMAND posix-clock-tests queue)
+      add_test(NAME posix-monotonic-clock-tests COMMAND posix-clock-tests monotonic)
+    endif()
+
     add_executable(mat-rtsp-retry-tests tests/MatRtspRetryTest.c)
     target_include_directories(mat-rtsp-retry-tests PRIVATE enet/include
       $<TARGET_PROPERTY:moonlight-common-c,INCLUDE_DIRECTORIES>)
@@ -249,12 +253,16 @@ if (BUILD_TESTING)
 
     add_executable(video-fec-interleave-tests tests/VideoFecInterleaveTest.c)
     add_executable(video-fec-socket-tests tests/VideoFecSocketTest.c)
+    add_executable(video-frame-loss-tests tests/VideoFrameLossTest.c)
     add_executable(udp-receive-error-tests tests/UdpReceiveErrorTest.c)
-    foreach(test IN ITEMS video-fec-interleave video-fec-socket udp-receive-error)
+    foreach(test IN ITEMS video-fec-interleave video-fec-socket video-frame-loss udp-receive-error)
       target_include_directories(${test}-tests PRIVATE enet/include
         $<TARGET_PROPERTY:moonlight-common-c,INCLUDE_DIRECTORIES>)
       target_compile_definitions(${test}-tests PRIVATE
         $<TARGET_PROPERTY:moonlight-common-c,COMPILE_DEFINITIONS>)
+      if(MSVC)
+        target_compile_options(${test}-tests PRIVATE /std:c11 /experimental:c11atomics)
+      endif()
       target_link_libraries(${test}-tests PRIVATE moonlight-common-c)
       add_test(NAME ${test}-tests COMMAND ${test}-tests)
     endforeach()

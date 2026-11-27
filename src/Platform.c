@@ -434,7 +434,9 @@ void PltWaitForConditionVariable(PLT_COND* cond, PLT_MUTEX* mutex) {
 
 // These functions return a number of microseconds or milliseconds since an opaque start time.
 
+#if defined(LC_WINDOWS) || defined(LC_DARWIN) || defined(__vita__) || defined(__3DS__)
 static bool ticks_started = false;
+#endif
 
 #if defined(LC_WINDOWS)
 
@@ -531,26 +533,41 @@ static struct timespec start_ts;
 # endif
 #endif
 
+static atomic_bool ticks_started = false;
 static bool has_monotonic_time = false;
-static struct timeval start_tv;
+static struct timeval last_wall_time;
+static uint64_t wall_elapsed_us;
+static atomic_flag wall_time_lock = ATOMIC_FLAG_INIT;
+
+static void lockWallTime(void) {
+    while (atomic_flag_test_and_set_explicit(&wall_time_lock, memory_order_acquire)) {}
+}
+
+static void unlockWallTime(void) {
+    atomic_flag_clear_explicit(&wall_time_lock, memory_order_release);
+}
 
 void PltTicksInit(void) {
-    if (ticks_started) {
+    if (atomic_load_explicit(&ticks_started, memory_order_acquire)) {
         return;
     }
-    ticks_started = true;
+    lockWallTime();
+    if (!atomic_load_explicit(&ticks_started, memory_order_relaxed)) {
 #ifdef HAVE_CLOCK_GETTIME
-    if (clock_gettime(PLT_MONOTONIC_CLOCK, &start_ts) == 0) {
-        has_monotonic_time = true;
-    } else
+        if (clock_gettime(PLT_MONOTONIC_CLOCK, &start_ts) == 0) {
+            has_monotonic_time = true;
+        } else
 #endif
-    {
-        gettimeofday(&start_tv, NULL);
+        {
+            gettimeofday(&last_wall_time, NULL);
+        }
+        atomic_store_explicit(&ticks_started, true, memory_order_release);
     }
+    unlockWallTime();
 }
 
 uint64_t PltGetMicroseconds(void) {
-    if (!ticks_started) {
+    if (!atomic_load_explicit(&ticks_started, memory_order_acquire)) {
         PltTicksInit();
     }
 
@@ -565,8 +582,19 @@ uint64_t PltGetMicroseconds(void) {
 #endif
     } else {
         struct timeval now;
+        lockWallTime();
         gettimeofday(&now, NULL);
-        return (uint64_t)(((int64_t)(now.tv_sec - start_tv.tv_sec) * 1000000) + (now.tv_usec - start_tv.tv_usec));
+        // A backward adjustment contributes no elapsed time. Rebase immediately
+        // so grace periods keep ticking even while the wall clock is before startup.
+        int64_t delta = ((int64_t)now.tv_sec - (int64_t)last_wall_time.tv_sec) * 1000000 +
+                        (now.tv_usec - last_wall_time.tv_usec);
+        if (delta > 0) {
+            wall_elapsed_us += (uint64_t)delta;
+        }
+        last_wall_time = now;
+        uint64_t elapsed = wall_elapsed_us;
+        unlockWallTime();
+        return elapsed;
     }
 }
 
